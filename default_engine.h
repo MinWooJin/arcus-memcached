@@ -1,6 +1,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,7 +67,7 @@ extern "C" {
 #define ITEM_IFLAG_BTREE 8   /* b+tree item */
 #define ITEM_IFLAG_COLL  14  /* collection item: list/set/b+tree */
 #define ITEM_LINKED  (1<<8)
-#define ITEM_SLABBED (2<<8)
+#define ITEM_SLABBED (2<<8)  /* NOT USED */
 
 #define META_OFFSET_IN_ITEM(nkey,nbytes) ((((nkey)+(nbytes)-1)/8+1)*8)
 
@@ -118,13 +119,31 @@ enum scrub_mode {
 
 struct engine_scrubber {
    pthread_mutex_t lock;
-   bool            running;
+   volatile bool   running;
    enum scrub_mode runmode;
    uint64_t        visited;
    uint64_t        cleaned;
    time_t          started;
    time_t          stopped;
 };
+
+#ifdef JHPARK_KEY_DUMP
+#define MAX_FILEPATH_LENGTH 256
+struct engine_dumper {
+   pthread_mutex_t lock;
+   bool            running;
+   bool            success; /* dump final status: success or fail */
+   bool            stop;    /* request to stop dump */
+   enum dump_mode  mode;    /* dump mode: key dump is only supported. */
+   uint64_t        visited; /* # of cache item visited */
+   uint64_t        dumpped; /* # of cache item dumped */
+   time_t          started; /* dump start time */
+   time_t          stopped; /* dump stop time */
+   char            filepath[MAX_FILEPATH_LENGTH]; /* dump file path */
+   char           *prefix;  /* prefix of keys for dumping */
+   int             nprefix;
+};
+#endif
 
 enum vbucket_state {
     VBUCKET_STATE_DEAD    = 0,
@@ -169,10 +188,14 @@ struct default_engine {
    pthread_mutex_t coll_del_lock;
    pthread_cond_t  coll_del_cond;
    bool            coll_del_sleep;
+   pthread_t       coll_del_tid; /* thread id */
 
    struct config config;
    struct engine_stats stats;
    struct engine_scrubber scrubber;
+#ifdef JHPARK_KEY_DUMP
+   struct engine_dumper dumper;
+#endif
    union {
        engine_info engine_info;
        char buffer[sizeof(engine_info) + (sizeof(feature_info)*LAST_REGISTERED_ENGINE_FEATURE)];

@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,15 +25,14 @@
  */
 #include <event.h>
 #include <pthread.h>
-
 #include <memcached/protocol_binary.h>
 #include <memcached/engine.h>
 #include <memcached/extension.h>
-
 #include "cache.h"
 #include "topkeys.h"
+#include "cmdlog.h"
+#include "lqdetect.h"
 #include "engine_loader.h"
-
 #include "sasl_defs.h"
 
 /* This is the address we use for admin purposes.  For example, doing stats
@@ -336,10 +336,11 @@ struct mc_stats {
     pthread_mutex_t mutex;
     unsigned int  daemon_conns; /* conns used by the server */
     unsigned int  curr_conns;
+    unsigned int  quit_conns;
+    unsigned int  rejected_conns; /* number of times I reject a client */
     unsigned int  total_conns;
     unsigned int  conn_structs;
     time_t        started;          /* when the process was started */
-    uint64_t      rejected_conns; /* number of times I reject a client */
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -373,6 +374,9 @@ struct settings {
     size_t item_size_max;   /* Maximum item size, and upper end for slabs */
     bool sasl;              /* SASL on/off */
     bool require_sasl;      /* require SASL auth */
+    int max_list_size;      /* Maximum elements in list collection */
+    int max_set_size;       /* Maximum elements in set collection */
+    int max_btree_size;     /* Maximum elements in b+tree collection */
     int topkeys;            /* Number of top keys to track */
     struct {
         EXTENSION_DAEMON_DESCRIPTOR *daemons;
@@ -406,6 +410,7 @@ typedef struct {
     pthread_mutex_t mutex;      /* Mutex to lock protect access to the pending_io */
     bool is_locked;
     struct conn *pending_io;    /* List of connection with pending async io ops */
+    struct conn *conn_list;     /* connection list managed by this thread */
     int index;                  /* index of this thread in the threads array */
     enum thread_type type;      /* Type of IO this thread processes */
 } LIBEVENT_THREAD;
@@ -479,6 +484,13 @@ struct conn {
     item_attr    coll_attr_space;
     item_attr   *coll_attrp;
     bool         coll_drop;    /* drop flag */
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+    int          coll_smgmode; /* smget exec mode : 0(oldexec), 1(duplicate), 2(unique) */
+#else
+    bool         coll_unique;  /* unique flag (used in smget) */
+#endif
+#endif
     bkey_range   coll_bkrange; /* bkey range */
     eflag_filter coll_efilter; /* eflag filter */
     eflag_update coll_eupdate; /* eflag update */
@@ -523,6 +535,10 @@ struct conn {
     int    suffixsize;
     char   **suffixcurr;
     int    suffixleft;
+
+#ifdef DETECT_LONG_QUERY
+    int    lq_bufcnt;
+#endif
 
     enum protocol protocol;   /* which protocol this connection speaks */
     enum network_transport transport; /* what transport is used by this connection */
@@ -572,6 +588,8 @@ struct conn {
     int keylen;
     conn   *next;     /* Used for generating a list of conn structures */
     LIBEVENT_THREAD *thread; /* Pointer to the thread object serving this connection */
+    conn *conn_prev;  /* used in the conn_list of a thread in charge */
+    conn *conn_next;  /* used in the conn_list of a thread in charge */
 
     ENGINE_ERROR_CODE aiostat;
     bool ewouldblock;

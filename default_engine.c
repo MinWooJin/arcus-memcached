@@ -1,6 +1,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -183,10 +184,13 @@ static void default_destroy(ENGINE_HANDLE* handle)
     struct default_engine* se = get_handle(handle);
 
     if (se->initialized) {
+        se->initialized = false;
+        item_final(se);
+        slabs_final(se);
+        assoc_final(se);
         pthread_mutex_destroy(&se->cache_lock);
         pthread_mutex_destroy(&se->stats.lock);
         pthread_mutex_destroy(&se->slabs.lock);
-        se->initialized = false;
         free(se);
     }
 }
@@ -208,13 +212,18 @@ static ENGINE_ERROR_CODE default_item_allocate(ENGINE_HANDLE* handle, const void
     }
 
     hash_item *it;
+    ENGINE_ERROR_CODE ret = ENGINE_EINVAL;
+
+    ACTION_BEFORE_WRITE(cookie, key, nkey);
     it = item_alloc(engine, key, nkey, flags, exptime, nbytes, cookie);
+    ACTION_AFTER_WRITE(cookie, ret);
     if (it != NULL) {
         *item = it;
-        return ENGINE_SUCCESS;
+        ret = ENGINE_SUCCESS;
     } else {
-        return ENGINE_ENOMEM;
+        ret = ENGINE_ENOMEM;
     }
+    return ret;
 }
 
 static ENGINE_ERROR_CODE default_item_delete(ENGINE_HANDLE* handle, const void* cookie,
@@ -226,18 +235,7 @@ static ENGINE_ERROR_CODE default_item_delete(ENGINE_HANDLE* handle, const void* 
     VBUCKET_GUARD(engine, vbucket);
 
     ACTION_BEFORE_WRITE(cookie, key, nkey);
-    hash_item *it = item_get(engine, key, nkey);
-    if (it == NULL) {
-        ret = ENGINE_KEY_ENOENT;
-    } else {
-        if (cas == 0 || cas == item_get_cas(it)) {
-            item_unlink(engine, it);
-            ret = ENGINE_SUCCESS;
-        } else {
-            ret = ENGINE_KEY_EEXISTS;
-        }
-        item_release(engine, it);
-    }
+    ret = item_delete(engine, key, nkey, cas);
     ACTION_AFTER_WRITE(cookie, ret);
     return ret;
 }
@@ -342,15 +340,22 @@ static ENGINE_ERROR_CODE default_list_struct_create(ENGINE_HANDLE* handle, const
 }
 
 static ENGINE_ERROR_CODE default_list_elem_alloc(ENGINE_HANDLE* handle, const void* cookie,
-                                                 eitem** eitem, const size_t nbytes)
+                                                 const void* key, const int nkey,
+                                                 const size_t nbytes, eitem** eitem)
 {
-    list_elem_item *elem = list_elem_alloc(get_handle(handle), nbytes, cookie);
+    list_elem_item *elem;
+    ENGINE_ERROR_CODE ret = ENGINE_EINVAL;
+
+    ACTION_BEFORE_WRITE(cookie, key, nkey);
+    elem = list_elem_alloc(get_handle(handle), nbytes, cookie);
+    ACTION_AFTER_WRITE(cookie, ret);
     if (elem != NULL) {
         *eitem = elem;
-        return ENGINE_SUCCESS;
+        ret = ENGINE_SUCCESS;
     } else {
-        return ENGINE_ENOMEM;
+        ret = ENGINE_ENOMEM;
     }
+    return ret;
 }
 
 static void default_list_elem_release(ENGINE_HANDLE* handle, const void *cookie,
@@ -402,13 +407,10 @@ static ENGINE_ERROR_CODE default_list_elem_get(ENGINE_HANDLE* handle, const void
     ENGINE_ERROR_CODE ret;
     VBUCKET_GUARD(engine, vbucket);
 
-    if (delete)
-        ACTION_BEFORE_WRITE(cookie, key, nkey);
+    if (delete) ACTION_BEFORE_WRITE(cookie, key, nkey);
     ret = list_elem_get(engine, key, nkey, from_index, to_index, delete, drop_if_empty,
                         (list_elem_item**)eitem_array, eitem_count, flags, dropped);
-    if (delete && *eitem_count > 0) {
-        ACTION_AFTER_WRITE(cookie, ret);
-    }
+    if (delete) ACTION_AFTER_WRITE(cookie, ret);
     return ret;
 }
 
@@ -429,15 +431,22 @@ static ENGINE_ERROR_CODE default_set_struct_create(ENGINE_HANDLE* handle, const 
 }
 
 static ENGINE_ERROR_CODE default_set_elem_alloc(ENGINE_HANDLE* handle, const void* cookie,
-                                                eitem** eitem, const size_t nbytes)
+                                                const void* key, const int nkey,
+                                                const size_t nbytes, eitem** eitem)
 {
-    set_elem_item *elem = set_elem_alloc(get_handle(handle), nbytes, cookie);
+    set_elem_item *elem;
+    ENGINE_ERROR_CODE ret = ENGINE_EINVAL;
+
+    ACTION_BEFORE_WRITE(cookie, key, nkey);
+    elem = set_elem_alloc(get_handle(handle), nbytes, cookie);
+    ACTION_AFTER_WRITE(cookie, ret);
     if (elem != NULL) {
         *eitem = elem;
-        return ENGINE_SUCCESS;
+        ret = ENGINE_SUCCESS;
     } else {
-        return ENGINE_ENOMEM;
+        ret = ENGINE_ENOMEM;
     }
+    return ret;
 }
 
 static void default_set_elem_release(ENGINE_HANDLE* handle, const void *cookie,
@@ -499,13 +508,10 @@ static ENGINE_ERROR_CODE default_set_elem_get(ENGINE_HANDLE* handle, const void*
     ENGINE_ERROR_CODE ret;
     VBUCKET_GUARD(engine, vbucket);
 
-    if (delete)
-        ACTION_BEFORE_WRITE(cookie, key, nkey);
+    if (delete) ACTION_BEFORE_WRITE(cookie, key, nkey);
     ret = set_elem_get(engine, key, nkey, count, delete, drop_if_empty,
                        (set_elem_item**)eitem, eitem_count, flags, dropped);
-    if (delete && *eitem_count > 0) {
-        ACTION_AFTER_WRITE(cookie, ret);
-    }
+    if (delete) ACTION_AFTER_WRITE(cookie, ret);
     return ret;
 }
 
@@ -526,16 +532,23 @@ static ENGINE_ERROR_CODE default_btree_struct_create(ENGINE_HANDLE* handle, cons
 }
 
 static ENGINE_ERROR_CODE default_btree_elem_alloc(ENGINE_HANDLE* handle, const void* cookie,
-                                                  eitem** eitem,
-                                                  const size_t nbkey, const size_t neflag, const size_t nbytes)
+                                                  const void* key, const int nkey,
+                                                  const size_t nbkey, const size_t neflag, const size_t nbytes,
+                                                  eitem** eitem)
 {
-    btree_elem_item *elem = btree_elem_alloc(get_handle(handle), nbkey, neflag, nbytes, cookie);
+    btree_elem_item *elem;
+    ENGINE_ERROR_CODE ret = ENGINE_EINVAL;
+
+    ACTION_BEFORE_WRITE(cookie, key, nkey);
+    elem = btree_elem_alloc(get_handle(handle), nbkey, neflag, nbytes, cookie);
+    ACTION_AFTER_WRITE(cookie, ret);
     if (elem != NULL) {
         *eitem = elem;
-        return ENGINE_SUCCESS;
+        ret = ENGINE_SUCCESS;
     } else {
-        return ENGINE_ENOMEM;
+        ret = ENGINE_ENOMEM;
     }
+    return ret;
 }
 
 static void default_btree_elem_release(ENGINE_HANDLE* handle, const void *cookie,
@@ -556,14 +569,13 @@ static ENGINE_ERROR_CODE default_btree_elem_insert(ENGINE_HANDLE* handle, const 
 
     ACTION_BEFORE_WRITE(cookie, key, nkey);
     if (trimmed == NULL) {
-        ret = btree_elem_insert(engine, key, nkey, (btree_elem_item *)eitem, replace_if_exist, attrp,
-                                replaced, created, NULL, NULL, NULL, cookie);
+        ret = btree_elem_insert(engine, key, nkey, (btree_elem_item *)eitem,
+                                replace_if_exist, attrp, replaced, created,
+                                NULL, NULL, NULL, cookie);
     } else {
-        btree_elem_item *trimmed_elem = NULL;
-        ret = btree_elem_insert(engine, key, nkey, (btree_elem_item *)eitem, replace_if_exist, attrp,
-                                replaced, created, &trimmed_elem,
-                                &trimmed->count, &trimmed->flags, cookie);
-        trimmed->elems = trimmed_elem;
+        ret = btree_elem_insert(engine, key, nkey, (btree_elem_item *)eitem,
+                                replace_if_exist, attrp, replaced, created,
+                                (btree_elem_item**)&trimmed->elems, &trimmed->count, &trimmed->flags, cookie);
     }
     ACTION_AFTER_WRITE(cookie, ret);
     return ret;
@@ -592,7 +604,8 @@ static ENGINE_ERROR_CODE default_btree_elem_delete(ENGINE_HANDLE* handle, const 
                                                    const eflag_filter *efilter,
                                                    const uint32_t req_count,
                                                    const bool drop_if_empty,
-                                                   uint32_t* del_count, bool* dropped,
+                                                   uint32_t* del_count, uint32_t *access_count,
+                                                   bool* dropped,
                                                    uint16_t vbucket)
 {
     struct default_engine *engine = get_handle(handle);
@@ -601,7 +614,7 @@ static ENGINE_ERROR_CODE default_btree_elem_delete(ENGINE_HANDLE* handle, const 
 
     ACTION_BEFORE_WRITE(cookie, key, nkey);
     ret = btree_elem_delete(engine, key, nkey, bkrange, efilter, req_count, drop_if_empty,
-                            del_count, dropped);
+                            del_count, access_count, dropped);
     ACTION_AFTER_WRITE(cookie, ret);
     return ret;
 }
@@ -633,6 +646,7 @@ static ENGINE_ERROR_CODE default_btree_elem_get(ENGINE_HANDLE* handle, const voi
                                                 const uint32_t req_count,
                                                 const bool delete, const bool drop_if_empty,
                                                 eitem** eitem_array, uint32_t* eitem_count,
+                                                uint32_t *access_count,
                                                 uint32_t* flags, bool* dropped_trimmed,
                                                 uint16_t vbucket)
 {
@@ -640,14 +654,11 @@ static ENGINE_ERROR_CODE default_btree_elem_get(ENGINE_HANDLE* handle, const voi
     ENGINE_ERROR_CODE ret;
     VBUCKET_GUARD(engine, vbucket);
 
-    if (delete)
-        ACTION_BEFORE_WRITE(cookie, key, nkey);
+    if (delete) ACTION_BEFORE_WRITE(cookie, key, nkey);
     ret = btree_elem_get(engine, key, nkey, bkrange, efilter, offset, req_count,
                          delete, drop_if_empty, (btree_elem_item**)eitem_array, eitem_count,
-                         flags, dropped_trimmed);
-    if (delete && *eitem_count > 0) {
-        ACTION_AFTER_WRITE(cookie, ret);
-    }
+                         access_count, flags, dropped_trimmed);
+    if (delete) ACTION_AFTER_WRITE(cookie, ret);
     return ret;
 }
 
@@ -655,14 +666,14 @@ static ENGINE_ERROR_CODE default_btree_elem_count(ENGINE_HANDLE* handle, const v
                                                   const void* key, const int nkey,
                                                   const bkey_range *bkrange,
                                                   const eflag_filter *efilter,
-                                                  uint32_t* eitem_count, uint32_t* flags,
+                                                  uint32_t* eitem_count, uint32_t* access_count,
                                                   uint16_t vbucket)
 {
     struct default_engine *engine = get_handle(handle);
     ENGINE_ERROR_CODE ret;
     VBUCKET_GUARD(engine, vbucket);
 
-    ret = btree_elem_count(engine, key, nkey, bkrange, efilter, eitem_count, flags);
+    ret = btree_elem_count(engine, key, nkey, bkrange, efilter, eitem_count, access_count);
     return ret;
 }
 
@@ -709,7 +720,8 @@ static ENGINE_ERROR_CODE default_btree_elem_get_by_posi(ENGINE_HANDLE* handle, c
 }
 
 #ifdef SUPPORT_BOP_SMGET
-static ENGINE_ERROR_CODE default_btree_elem_smget(ENGINE_HANDLE* handle, const void* cookie,
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+static ENGINE_ERROR_CODE default_btree_elem_smget_old(ENGINE_HANDLE* handle, const void* cookie,
                                                   token_t *karray, const int kcount,
                                                   const bkey_range *bkrange,
                                                   const eflag_filter *efilter,
@@ -727,9 +739,44 @@ static ENGINE_ERROR_CODE default_btree_elem_smget(ENGINE_HANDLE* handle, const v
     ENGINE_ERROR_CODE ret;
     VBUCKET_GUARD(engine, vbucket);
 
+    ret = btree_elem_smget_old(engine, karray, kcount, bkrange, efilter, offset, count,
+                           (btree_elem_item**)eitem_array, kfnd_array, flag_array, eitem_count,
+                           missed_key_array, missed_key_count, trimmed, duplicated);
+    return ret;
+}
+#endif
+
+static ENGINE_ERROR_CODE default_btree_elem_smget(ENGINE_HANDLE* handle, const void* cookie,
+                                                  token_t *karray, const int kcount,
+                                                  const bkey_range *bkrange,
+                                                  const eflag_filter *efilter,
+                                                  const uint32_t offset, const uint32_t count,
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+                                                  const bool unique,
+                                                  smget_result_t *result,
+#else
+                                                  eitem** eitem_array,
+                                                  uint32_t* kfnd_array,
+                                                  uint32_t* flag_array,
+                                                  uint32_t* eitem_count,
+                                                  uint32_t* missed_key_array,
+                                                  uint32_t* missed_key_count,
+                                                  bool *trimmed, bool *duplicated,
+#endif
+                                                  uint16_t vbucket)
+{
+    struct default_engine *engine = get_handle(handle);
+    ENGINE_ERROR_CODE ret;
+    VBUCKET_GUARD(engine, vbucket);
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    ret = btree_elem_smget(engine, karray, kcount, bkrange, efilter,
+                           offset, count, unique, result);
+#else
     ret = btree_elem_smget(engine, karray, kcount, bkrange, efilter, offset, count,
                            (btree_elem_item**)eitem_array, kfnd_array, flag_array, eitem_count,
                            missed_key_array, missed_key_count, trimmed, duplicated);
+#endif
     return ret;
 }
 #endif
@@ -840,6 +887,11 @@ static ENGINE_ERROR_CODE default_get_stats(ENGINE_HANDLE* handle, const void* co
     else if (strncmp(stat_key, "scrub", 5) == 0) {
         item_stats_scrub(engine, add_stat, cookie);
     }
+#ifdef JHPARK_KEY_DUMP
+    else if (strncmp(stat_key, "dump", 4) == 0) {
+        item_stats_dump(engine, add_stat, cookie);
+    }
+#endif
     else {
         ret = ENGINE_KEY_ENOENT;
     }
@@ -876,6 +928,31 @@ static char *default_cachedump(ENGINE_HANDLE* handle, const void* cookie,
     return item_cachedump(engine, slabs_clsid, limit, forward, sticky, bytes);
 }
 
+#ifdef JHPARK_KEY_DUMP
+static ENGINE_ERROR_CODE default_dump(ENGINE_HANDLE* handle, const void* cookie,
+                          const char *opstr, const char *modestr,
+                          const char *prefix, const int nprefix, const char *filepath)
+{
+    struct default_engine* engine = get_handle(handle);
+    enum dump_op   op;
+    enum dump_mode mode;
+
+    if (memcmp(opstr, "start", 5) == 0) {
+        op = DUMP_OP_START;
+        if (memcmp(modestr, "key", 3) != 0) {
+            return ENGINE_ENOTSUP;
+        }
+        mode = DUMP_MODE_KEY;
+    } else if (memcmp(opstr, "stop", 4) == 0) {
+        op = DUMP_OP_STOP;
+        mode = DUMP_MODE_NONE;
+    } else {
+        return ENGINE_ENOTSUP;
+    }
+    return item_dump(engine, op, mode, prefix, nprefix, filepath);
+}
+#endif
+
 /* Config */
 
 static ENGINE_ERROR_CODE default_set_memlimit(ENGINE_HANDLE* handle, const void* cookie,
@@ -897,6 +974,16 @@ static ENGINE_ERROR_CODE default_set_memlimit(ENGINE_HANDLE* handle, const void*
     pthread_mutex_unlock(&engine->cache_lock);
     return ret;
 }
+
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+static ENGINE_ERROR_CODE default_set_maxcollsize(ENGINE_HANDLE* handle, const void* cookie,
+                                                 const int coll_type, int *maxsize)
+{
+    struct default_engine* engine = get_handle(handle);
+
+    return item_conf_set_maxcollsize(engine, coll_type, maxsize);
+}
+#endif
 
 static void default_set_verbose(ENGINE_HANDLE* handle, const void* cookie, const size_t verbose)
 {
@@ -1220,6 +1307,9 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface, GET_SERVER_API get_server_
          .btree_posi_find_with_get = default_btree_posi_find_with_get,
          .btree_elem_get_by_posi = default_btree_elem_get_by_posi,
 #ifdef SUPPORT_BOP_SMGET
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+         .btree_elem_smget_old = default_btree_elem_smget_old,
+#endif
          .btree_elem_smget   = default_btree_elem_smget,
 #endif
          /* Attribute functions */
@@ -1231,9 +1321,15 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface, GET_SERVER_API get_server_
          .reset_stats      = default_reset_stats,
          .get_prefix_stats = default_get_prefix_stats,
          .cachedump        = default_cachedump,
+#ifdef JHPARK_KEY_DUMP
+         .dump             = default_dump,
+#endif
 
          /* Config */
          .set_memlimit     = default_set_memlimit,
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+         .set_maxcollsize  = default_set_maxcollsize,
+#endif
          .set_verbose      = default_set_verbose,
 
          .unknown_command  = default_unknown_command,
@@ -1248,7 +1344,7 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface, GET_SERVER_API get_server_
       .get_server_api = get_server_api,
       .initialized = true,
       .assoc = {
-         .hashpower = 16,
+         .hashpower = 17, /* (1<<17) => 128K hash size */
          .tot_prefix_items = 0,
       },
       .slabs = {
@@ -1277,6 +1373,7 @@ ENGINE_ERROR_CODE create_instance(uint64_t interface, GET_SERVER_API get_server_
        },
       .scrubber = {
          .lock = PTHREAD_MUTEX_INITIALIZER,
+         .running = false,
       },
       .info.engine_info = {
            .description = "Default engine v0.1",

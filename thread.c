@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -252,6 +253,8 @@ static void setup_thread(LIBEVENT_THREAD *me) {
  */
 static void *worker_libevent(void *arg) {
     LIBEVENT_THREAD *me = arg;
+    struct conn *conn;
+    CQ_ITEM *item;
 
     /* Any per-thread setup can happen here; thread_init() will block until
      * all threads have finished initializing.
@@ -263,6 +266,19 @@ static void *worker_libevent(void *arg) {
     pthread_mutex_unlock(&init_lock);
 
     event_base_loop(me->base, 0);
+
+    /* close all connections */
+    conn = me->conn_list;
+    while (conn != NULL) {
+        close(conn->sfd);
+        conn = conn->conn_next;
+    }
+    item = cq_pop(me->new_conn_queue);
+    while (item != NULL) {
+        close(item->sfd);
+        cqi_free(item);
+        item = cq_pop(me->new_conn_queue);
+    }
     return NULL;
 }
 
@@ -286,7 +302,12 @@ static void thread_libevent_process(int fd, short which, void *arg) {
     CQ_ITEM *item;
     char buf[1];
 
-    if (memcached_shutdown) {
+    if (memcached_shutdown > 1) {
+        if (settings.verbose > 0) {
+            mc_logger->log(EXTENSION_LOG_INFO, NULL,
+                "Worker thread[%d] is now terminating from libevent process.\n",
+                me->index);
+        }
         event_base_loopbreak(me->base);
         return;
     }
@@ -318,6 +339,12 @@ static void thread_libevent_process(int fd, short which, void *arg) {
         } else {
             assert(c->thread == NULL);
             c->thread = me;
+            /* link to the conn_list of the thread */
+            if (me->conn_list != NULL) {
+                c->conn_next = me->conn_list;
+                me->conn_list->conn_prev = c;
+            }
+            me->conn_list = c;
         }
         cqi_free(item);
     }

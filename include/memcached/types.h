@@ -1,6 +1,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,7 +33,11 @@ struct iovec {
 
 #define SUPPORT_BOP_MGET
 #define SUPPORT_BOP_SMGET
+#define JHPARK_NEW_SMGET_INTERFACE
+#define CONFIG_MAX_COLLECTION_SIZE
 #define MAX_EFLAG_COMPARE_COUNT 100
+
+#define JHPARK_KEY_DUMP
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +65,9 @@ extern "C" {
         ENGINE_DISCONNECT  = 0x0a, /**< Tell the server to disconnect this client */
         ENGINE_EACCESS     = 0x0b, /**< Access control violations */
         ENGINE_NOT_MY_VBUCKET = 0x0c, /** < This vbucket doesn't belong to me */
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        ENGINE_EDUPLICATE  = 0x0d, /** < Duplicate value(ex, bkey) */
+#endif
 
         ENGINE_EBADTYPE     = 0x32, /**< Not supported operation, bad type */
         ENGINE_EOVERFLOW    = 0x33, /**< The collection is full of elements */
@@ -281,6 +289,36 @@ extern "C" {
         uint8_t  bitwop;
         uint8_t reserved[6];
     } eflag_update;
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    /* Key info of the found elements in smget */
+    typedef struct {
+        uint16_t kidx;  /* key index in keys array */
+        uint32_t flag;  /* item flags */
+    } smget_ehit_t;
+
+    /* Key info of the missed/trimmed keys in smget */
+    typedef struct {
+        uint16_t kidx;  /* key index in keys array */
+        uint16_t code;  /* error code if the key is missed */
+    } smget_emis_t;
+
+    /* smget result structure */
+    typedef struct {
+        eitem       **elem_array; /* found elements in smget */
+        smget_ehit_t *elem_kinfo; /* key info of found elements */
+        smget_emis_t *miss_kinfo; /* key info of missed keys */
+        smget_emis_t *trim_kinfo; /* key info of trimmed keys */
+        eitem       **trim_elems; /* the element before trim in each trimmed key */
+        uint32_t      elem_count; /* # of found elements */
+        uint32_t      miss_count; /* # of missed keys */
+        uint32_t      trim_count; /* # of trimmed keys */
+        uint32_t      elem_arrsz; /* elem array size */
+        uint32_t      keys_arrsz; /* miss & trim array size */
+        bool          duplicated; /* bkey is duplicated ? */
+        bool          ascending;  /* bkey order of found elements: ascending ? */
+    } smget_result_t;
+#endif
 
     /* item attribute structure */
     typedef struct {

@@ -1,6 +1,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -69,6 +70,7 @@ struct slabs {
 ENGINE_ERROR_CODE slabs_init(struct default_engine *engine,
                              const size_t limit, const double factor,
                              const bool prealloc);
+void              slabs_final(struct default_engine *engine);
 
 
 /**

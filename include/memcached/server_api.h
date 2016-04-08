@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -110,6 +111,15 @@ extern "C" {
          * @return the client ip address of the session for the given cookie.
          */
         const char* (*get_client_ip)(const void *cookie);
+
+        /**
+         * Retrieve thread index for the given cookie.
+         *
+         * @param cookie The cookie provided by the frontend
+         *
+         * @return the thread index from 0 to num_threads-1.
+         */
+        int (*get_thread_index)(const void *cookie);
 
         /**
          * Let a connection know that IO has completed.

@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -146,7 +147,10 @@ static int MAX_BTREE_SIZE = 50000;
     pthread_mutex_unlock(&thread_stats->mutex); \
 }
 
-volatile sig_atomic_t memcached_shutdown;
+#define GET_8ALIGN_SIZE(size) \
+    (((size) % 8) == 0 ? (size) : ((size) + (8 - ((size) % 8))))
+
+volatile sig_atomic_t memcached_shutdown=0;
 
 /*
  * We keep the current time of day in a global variable that's updated by a
@@ -182,6 +186,14 @@ static struct engine_event_handler *engine_event_handlers[MAX_ENGINE_EVENT_TYPE 
 
 #ifdef ENABLE_ZK_INTEGRATION
 static char *arcus_zk_cfg = NULL;
+#endif
+
+#ifdef COMMAND_LOGGING
+static bool cmdlog_in_use = false;
+#endif
+
+#ifdef DETECT_LONG_QUERY
+static bool lqdetect_in_use = false;
 #endif
 
 /*
@@ -279,6 +291,7 @@ static rel_time_t realtime(const time_t exptime) {
 static void stats_init(void) {
     mc_stats.daemon_conns = 0;
     mc_stats.rejected_conns = 0;
+    mc_stats.quit_conns = 0;
     mc_stats.curr_conns = mc_stats.total_conns = mc_stats.conn_structs = 0;
 
     /* make the time we started always be 2 seconds before we really
@@ -293,6 +306,7 @@ static void stats_reset(const void *cookie) {
     struct conn *conn = (struct conn*)cookie;
     STATS_LOCK();
     mc_stats.rejected_conns = 0;
+    mc_stats.quit_conns = 0;
     mc_stats.total_conns = 0;
     stats_prefix_clear();
     STATS_UNLOCK();
@@ -324,6 +338,9 @@ static void settings_init(void) {
     settings.backlog = 1024;
     settings.binding_protocol = negotiating_prot;
     settings.item_size_max = 1024 * 1024; /* The famous 1MB upper limit. */
+    settings.max_list_size = MAX_LIST_SIZE;
+    settings.max_set_size = MAX_SET_SIZE;
+    settings.max_btree_size = MAX_BTREE_SIZE;
     settings.topkeys = 0;
     settings.require_sasl = false;
     settings.extensions.logger = get_stderr_logger();
@@ -655,6 +672,12 @@ conn *conn_new(const int sfd, STATE_FUNC init_state,
     c->msgcurr = 0;
     c->msgused = 0;
     c->next = NULL;
+    c->conn_prev = NULL;
+    c->conn_next = NULL;
+
+#ifdef DETECT_LONG_QUERY
+    c->lq_bufcnt = 0;
+#endif
 
     c->write_and_go = init_state;
     c->write_and_free = 0;
@@ -693,7 +716,13 @@ conn *conn_new(const int sfd, STATE_FUNC init_state,
     /* save client ip address in connection object */
     struct sockaddr_in addr;
     socklen_t addrlen = sizeof(addr);
-    getpeername(c->sfd, (struct sockaddr*)&addr, &addrlen);
+    if (getpeername(c->sfd, (struct sockaddr*)&addr, &addrlen) != 0) {
+        if (init_state == conn_new_cmd) {
+            mc_logger->log(EXTENSION_LOG_WARNING, c,
+                           "getpeername(fd=%d) has failed: %s\n",
+                           c->sfd, strerror(errno));
+        }
+    }
     snprintf(c->client_ip, 16, "%s", inet_ntoa(addr.sin_addr));
 
     MEMCACHED_CONN_ALLOCATE(c->sfd);
@@ -772,6 +801,13 @@ static void conn_cleanup(conn *c) {
         c->item = 0;
     }
 
+#ifdef DETECT_LONG_QUERY
+    if (c->lq_bufcnt != 0) {
+        lqdetect_buffer_release(c->lq_bufcnt);
+        c->lq_bufcnt = 0;
+    }
+#endif
+
     if (c->coll_eitem != NULL) {
         conn_coll_eitem_free(c);
     }
@@ -799,6 +835,16 @@ static void conn_cleanup(conn *c) {
     }
 
     c->engine_storage = NULL;
+    /* disconnect it from the conn_list of a thread in charge */
+    if (c->conn_prev != NULL) {
+        c->conn_prev->conn_next = c->conn_next;
+    } else {
+        assert(c->thread->conn_list == c);
+        c->thread->conn_list = c->conn_next;
+    }
+    if (c->conn_next != NULL) {
+        c->conn_next->conn_prev = c->conn_prev;
+    }
     c->thread = NULL;
     assert(c->next == NULL);
     c->ascii_cmd = NULL;
@@ -1103,33 +1149,45 @@ static void out_string(conn *c, const char *str) {
     }
 
     if (c->pipe_state != PIPE_STATE_OFF) {
-        assert(c->pipe_state == PIPE_STATE_ON);
-        if (c->pipe_count == 0) {
-            /* initialize pipe respoinses */
-            /* response header format : "RESPONSE %d\r\n" */
-            c->pipe_reslen = 11 + 3; /* 3: max length of count */
-            c->pipe_resptr = &c->pipe_response[c->pipe_reslen];
-        }
-        if ((c->pipe_reslen + (len+2)) < (PIPE_MAX_RES_SIZE-40)) {
-            sprintf(c->pipe_resptr, "%s\r\n", str);
-            c->pipe_reslen += (len+2);
-            c->pipe_resptr = &c->pipe_response[c->pipe_reslen];
-            c->pipe_count++;
-            if (c->pipe_count >= PIPE_MAX_CMD_COUNT && c->noreply == true) {
-                c->pipe_state = PIPE_STATE_ERR_CFULL; /* pipe count overflow */
+        if (c->pipe_state == PIPE_STATE_ON) {
+            if (c->pipe_count == 0) {
+                /* initialize pipe responses */
+                /* response header format : "RESPONSE %d\r\n" */
+                c->pipe_reslen = 11 + 3; /* 3: max length of count */
+                c->pipe_resptr = &c->pipe_response[c->pipe_reslen];
+            }
+            if ((c->pipe_reslen + (len+2)) < (PIPE_MAX_RES_SIZE-40)) {
+                sprintf(c->pipe_resptr, "%s\r\n", str);
+                c->pipe_reslen += (len+2);
+                c->pipe_resptr = &c->pipe_response[c->pipe_reslen];
+                c->pipe_count++;
+                if (c->pipe_count >= PIPE_MAX_CMD_COUNT && c->noreply == true) {
+                    c->pipe_state = PIPE_STATE_ERR_CFULL; /* pipe count overflow */
+                    c->noreply = false; /* stop pipelining */
+                }
+            } else {
+                c->pipe_state = PIPE_STATE_ERR_MFULL; /* pipe memory overflow */
                 c->noreply = false; /* stop pipelining */
+            }
+            if (c->pipe_state == PIPE_STATE_ON) {
+                if ((strncmp(str, "CLIENT_ERROR", 12) == 0) ||
+                    (strncmp(str, "SERVER_ERROR", 12) == 0) ||
+                    (strncmp(str, "ERROR", 5) == 0)) { /* severe error */
+                    c->pipe_state = PIPE_STATE_ERR_BAD; /* bad error in pipelining */
+                    c->noreply = false; /* stop pipelining */
+                }
             }
         } else {
-            c->pipe_state = PIPE_STATE_ERR_MFULL; /* pipe memory overflow */
-            c->noreply = false; /* stop pipelining */
-        }
-        if (c->pipe_state == PIPE_STATE_ON) {
-            if ((strncmp(str, "CLIENT_ERROR", 12) == 0) ||
-                (strncmp(str, "SERVER_ERROR", 12) == 0) ||
-                (strncmp(str, "ERROR", 5) == 0)) { /* severe error */
-                c->pipe_state = PIPE_STATE_ERR_BAD; /* bad error in pipelining */
-                c->noreply = false; /* stop pipelining */
-            }
+            /* A response message has come here before pipe error is reset.
+             * Maybe, clients may not send all the commands of the pipelining.
+             * So, force to reset the current pipelining.
+             */
+            mc_logger->log(EXTENSION_LOG_INFO, c,
+                           "%d: response message before pipe error is reset. %s\n",
+                           c->sfd, str);
+            /* clear pipe_state: the end of pipe */
+            c->pipe_state = PIPE_STATE_OFF;
+            c->pipe_count = 0;
         }
     }
 
@@ -1172,9 +1230,15 @@ static void out_string(conn *c, const char *str) {
         sprintf(&c->pipe_response[0], "RESPONSE %3d", c->pipe_count);
         memcpy(&c->pipe_response[12], "\r\n", 2);
 
-        /* clear pipe_state: the end of pipe */
-        c->pipe_state = PIPE_STATE_OFF;
-        c->pipe_count = 0;
+        if (c->pipe_state == PIPE_STATE_ON) {
+            /* clear pipe_state: the end of pipe */
+            c->pipe_state = PIPE_STATE_OFF;
+            c->pipe_count = 0;
+        } else {
+            /* The pipe_state will be reset
+             * after swallowing the remaining data.
+             */
+        }
 
         c->wbytes = c->pipe_reslen;
         c->wcurr  = c->pipe_response;
@@ -1254,6 +1318,24 @@ static void process_lop_insert_complete(conn *c) {
         if (settings.detail_enabled) {
             stats_prefix_record_lop_insert(c->coll_key, c->coll_nkey, (ret==ENGINE_SUCCESS));
         }
+
+#ifdef DETECT_LONG_QUERY
+        /* long query detection */
+        if (lqdetect_in_use && ret == ENGINE_SUCCESS) {
+            uint32_t overhead = c->coll_index >= 0 ? c->coll_index+1 : -(c->coll_index);
+            if (lqdetect_discriminant(overhead)) {
+                struct lq_detect_argument argument;
+                char *bufptr = argument.range;
+
+                snprintf(bufptr, 16, "%d", c->coll_index);
+                argument.overhead = overhead;
+
+                if (! lqdetect_save_cmd(c->client_ip, c->coll_key, LQCMD_LOP_INSERT, &argument)) {
+                    lqdetect_in_use = false;
+                }
+            }
+        }
+#endif
 
         switch (ret) {
         case ENGINE_SUCCESS:
@@ -1676,8 +1758,9 @@ static void process_bop_mget_complete(conn *c) {
     ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
     eitem **elem_array = (eitem **)c->coll_eitem;
     uint32_t tot_elem_count = 0;
+    uint32_t tot_access_count = 0;
     char delimiter = ',';
-    token_t key_tokens[MAX_BMGET_KEY_COUNT];
+    token_t *key_tokens = (token_t *)((char*)c->coll_mkeys + GET_8ALIGN_SIZE(c->coll_lenkeys));
 
     if ((strncmp((char*)c->coll_mkeys + c->coll_lenkeys - 2, "\r\n", 2) != 0) ||
         (tokenize_keys((char*)c->coll_mkeys, delimiter, c->coll_numkeys, key_tokens) == -1))
@@ -1687,6 +1770,7 @@ static void process_bop_mget_complete(conn *c) {
     else /* valid key_tokens */
     {
         uint32_t cur_elem_count = 0;
+        uint32_t cur_access_count = 0;
         uint32_t flags, k, e;
         bool trimmed;
         eitem_info info;
@@ -1712,7 +1796,7 @@ static void process_bop_mget_complete(conn *c) {
                                              c->coll_roffset, c->coll_rcount,
                                              false, false,
                                              &elem_array[tot_elem_count], &cur_elem_count,
-                                             &flags, &trimmed, 0);
+                                             &cur_access_count, &flags, &trimmed, 0);
 
             if (settings.detail_enabled) {
                 stats_prefix_record_bop_get(key_tokens[k].value, key_tokens[k].length,
@@ -1747,6 +1831,8 @@ static void process_bop_mget_complete(conn *c) {
                     STATS_ELEM_HITS(c, bop_get, key_tokens[k].value, key_tokens[k].length);
                     tot_elem_count += cur_elem_count;
                     cur_elem_count = 0;
+                    tot_access_count += cur_access_count;
+                    cur_access_count = 0;
                 } else {
                     STATS_NOKEY(c, cmd_bop_get);
                     // ret == ENGINE_ENOMEM
@@ -1791,6 +1877,8 @@ static void process_bop_mget_complete(conn *c) {
             // ret != ENGINE_SUCCESS
             tot_elem_count += cur_elem_count;
             cur_elem_count = 0;
+            tot_access_count += cur_access_count;
+            cur_access_count = 0;
         }
     }
 
@@ -1832,27 +1920,55 @@ static void process_bop_mget_complete(conn *c) {
 #endif
 
 #ifdef SUPPORT_BOP_SMGET
-static void process_bop_smget_complete(conn *c) {
-    assert(c->coll_op == OPERATION_BOP_SMGET);
-    assert(c->coll_eitem != NULL);
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+static char *get_smget_miss_response(int res)
+{
+    if (res == ENGINE_KEY_ENOENT)      return " NOT_FOUND\r\n";
+    else if (res == ENGINE_UNREADABLE) return " UNREADABLE\r\n";
+    else if (res == ENGINE_EBKEYOOR)   return " OUT_OF_RANGE\r\n";
+    else                               return " UNKNOWN\r\n";
+}
+
+static int make_smget_trim_response(char *bufptr, eitem_info *info)
+{
+    char *tmpptr = bufptr;
+
+    /* bkey */
+    if (info->nscore > 0) {
+        memcpy(tmpptr, " 0x", 3); tmpptr += 3;
+        safe_hexatostr(info->score, info->nscore, tmpptr);
+        tmpptr += strlen(tmpptr);
+    } else {
+        sprintf(tmpptr, " %"PRIu64"", *(uint64_t*)info->score);
+        tmpptr += strlen(tmpptr);
+    }
+    sprintf(tmpptr, "\r\n");
+    tmpptr += 2;
+    return (int)(tmpptr - bufptr);
+}
+#endif
+
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+static void process_bop_smget_complete_old(conn *c) {
     int i, idx;
-    int smget_count = c->coll_roffset + c->coll_rcount;
-    int elem_array_size = smget_count * (sizeof(eitem*) + (2*sizeof(uint32_t)));
-    int keys_array_size = c->coll_numkeys * sizeof(token_t);
-    int kmis_array_size = c->coll_numkeys * sizeof(uint32_t);
     char *vptr = (char*)c->coll_mkeys;
     char delimiter = ',';
+    token_t *keys_array = (token_t *)(vptr + GET_8ALIGN_SIZE(c->coll_lenkeys));
+    char *respptr;
+    int   resplen;
+    int smget_count = c->coll_roffset + c->coll_rcount;
+    int kmis_array_size = c->coll_numkeys * sizeof(uint32_t);
 
     uint32_t  kmis_count = 0;
     uint32_t  elem_count = 0;
     eitem   **elem_array = (eitem  **)c->coll_eitem;
     uint32_t *kfnd_array = (uint32_t*)((char*)elem_array + (smget_count*sizeof(eitem*)));
     uint32_t *flag_array = (uint32_t*)((char*)kfnd_array + (smget_count*sizeof(uint32_t)));
-    token_t  *keys_array = (token_t *)((char*)elem_array + elem_array_size);
-    uint32_t *kmis_array = (uint32_t*)((char*)keys_array + keys_array_size);
-
+    uint32_t *kmis_array = (uint32_t*)((char*)flag_array + (smget_count*sizeof(uint32_t)));
     bool trimmed;
     bool duplicated;
+
+    respptr = ((char*)kmis_array + kmis_array_size);
 
     ENGINE_ERROR_CODE ret;
     if ((strncmp(vptr + c->coll_lenkeys - 2, "\r\n", 2) != 0) ||
@@ -1864,7 +1980,7 @@ static void process_bop_smget_complete(conn *c) {
                    (c->coll_bkrange.from_nbkey==0 ? sizeof(uint64_t) : c->coll_bkrange.from_nbkey));
             c->coll_bkrange.to_nbkey = c->coll_bkrange.from_nbkey;
         }
-        ret = mc_engine.v1->btree_elem_smget(mc_engine.v0, c,
+        ret = mc_engine.v1->btree_elem_smget_old(mc_engine.v0, c,
                                              keys_array, c->coll_numkeys,
                                              &c->coll_bkrange,
                                              (c->coll_efilter.ncompval==0 ? NULL : &c->coll_efilter),
@@ -1877,8 +1993,6 @@ static void process_bop_smget_complete(conn *c) {
     case ENGINE_SUCCESS:
         {
         eitem_info info[elem_count+1]; /* elem_count might be 0. */
-        char *respptr = ((char*)kmis_array + kmis_array_size);
-        int   resplen;
 
         do {
             sprintf(respptr, "VALUE %u\r\n", elem_count);
@@ -1961,6 +2075,268 @@ static void process_bop_smget_complete(conn *c) {
         else if (ret == ENGINE_EBADBKEY) out_string(c, "BKEY_MISMATCH");
         else if (ret == ENGINE_EBADATTR) out_string(c, "ATTR_MISMATCH");
         else if (ret == ENGINE_EBKEYOOR) out_string(c, "OUT_OF_RANGE");
+        else out_string(c, "SERVER_ERROR internal");
+    }
+
+    if (ret != ENGINE_SUCCESS) {
+        if (c->coll_mkeys != NULL) {
+            free((void *)c->coll_mkeys);
+            c->coll_mkeys = NULL;
+        }
+        if (c->coll_eitem != NULL) {
+            free((void *)c->coll_eitem);
+            c->coll_eitem = NULL;
+        }
+    }
+}
+#endif
+
+static void process_bop_smget_complete(conn *c) {
+    assert(c->coll_op == OPERATION_BOP_SMGET);
+    assert(c->coll_eitem != NULL);
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+    if (c->coll_smgmode == 0) {
+        process_bop_smget_complete_old(c);
+        return;
+    }
+#endif
+    int i, idx;
+    char *vptr = (char*)c->coll_mkeys;
+    char delimiter = ',';
+    token_t *keys_array = (token_t *)(vptr + GET_8ALIGN_SIZE(c->coll_lenkeys));
+    char *respptr;
+    int   resplen;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    smget_result_t smres;
+
+    smres.elem_array = (eitem **)c->coll_eitem;
+    smres.elem_kinfo = (smget_ehit_t *)&smres.elem_array[c->coll_rcount+c->coll_numkeys];
+    smres.miss_kinfo = (smget_emis_t *)&smres.elem_kinfo[c->coll_rcount];
+
+    respptr = (char *)&smres.miss_kinfo[c->coll_numkeys];
+#else
+    int smget_count = c->coll_roffset + c->coll_rcount;
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+#else
+    int elem_array_size = smget_count * (sizeof(eitem*) + (2*sizeof(uint32_t)));
+#endif
+    int kmis_array_size = c->coll_numkeys * sizeof(uint32_t);
+
+    uint32_t  kmis_count = 0;
+    uint32_t  elem_count = 0;
+    eitem   **elem_array = (eitem  **)c->coll_eitem;
+    uint32_t *kfnd_array = (uint32_t*)((char*)elem_array + (smget_count*sizeof(eitem*)));
+    uint32_t *flag_array = (uint32_t*)((char*)kfnd_array + (smget_count*sizeof(uint32_t)));
+    uint32_t *kmis_array = (uint32_t*)((char*)flag_array + (smget_count*sizeof(uint32_t)));
+    bool trimmed;
+    bool duplicated;
+
+    respptr = ((char*)kmis_array + kmis_array_size);
+#endif
+
+    ENGINE_ERROR_CODE ret;
+    if ((strncmp(vptr + c->coll_lenkeys - 2, "\r\n", 2) != 0) ||
+        (tokenize_keys(vptr, delimiter, c->coll_numkeys, keys_array) == -1)) {
+        ret = ENGINE_EBADVALUE;
+    } else {
+        if (c->coll_bkrange.to_nbkey == BKEY_NULL) {
+            memcpy(c->coll_bkrange.to_bkey, c->coll_bkrange.from_bkey,
+                   (c->coll_bkrange.from_nbkey==0 ? sizeof(uint64_t) : c->coll_bkrange.from_nbkey));
+            c->coll_bkrange.to_nbkey = c->coll_bkrange.from_nbkey;
+        }
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        ret = mc_engine.v1->btree_elem_smget(mc_engine.v0, c,
+                                             keys_array, c->coll_numkeys,
+                                             &c->coll_bkrange,
+                                             (c->coll_efilter.ncompval==0 ? NULL : &c->coll_efilter),
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+                                             c->coll_roffset, c->coll_rcount,
+                                             (c->coll_smgmode == 2 ? true : false),
+#else
+                                             c->coll_roffset, c->coll_rcount, c->coll_unique,
+#endif
+                                             &smres, 0);
+#else
+        ret = mc_engine.v1->btree_elem_smget(mc_engine.v0, c,
+                                             keys_array, c->coll_numkeys,
+                                             &c->coll_bkrange,
+                                             (c->coll_efilter.ncompval==0 ? NULL : &c->coll_efilter),
+                                             c->coll_roffset, c->coll_rcount,
+                                             elem_array, kfnd_array, flag_array, &elem_count,
+                                             kmis_array, &kmis_count, &trimmed, &duplicated, 0);
+#endif
+    }
+
+    switch (ret) {
+    case ENGINE_SUCCESS:
+        {
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        eitem_info info[smres.elem_count+1]; /* elem_count might be 0. */
+#else
+        eitem_info info[elem_count+1]; /* elem_count might be 0. */
+#endif
+
+        do {
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            /* Change smget response head string: VALUE => ELEMENTS.
+             * It makes incompatible with the clients of lower version.
+             */
+            sprintf(respptr, "ELEMENTS %u\r\n", smres.elem_count);
+#else
+            sprintf(respptr, "VALUE %u\r\n", elem_count);
+#endif
+            if (add_iov(c, respptr, strlen(respptr)) != 0) {
+                ret = ENGINE_ENOMEM; break;
+            }
+            respptr += strlen(respptr);
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            for (i = 0; i < smres.elem_count; i++) {
+                mc_engine.v1->get_btree_elem_info(mc_engine.v0, c,
+                                  smres.elem_array[i], &info[i]);
+                sprintf(respptr, " %u ", htonl(smres.elem_kinfo[i].flag));
+                resplen = strlen(respptr);
+                resplen += make_bop_elem_response(respptr + resplen, &info[i]);
+                idx = smres.elem_kinfo[i].kidx;
+                if ((add_iov(c, keys_array[idx].value, keys_array[idx].length) != 0) ||
+                    (add_iov(c, respptr, resplen) != 0) ||
+                    (add_iov(c, info[i].value, info[i].nbytes) != 0)) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+                respptr += resplen;
+            }
+#else
+            for (i = 0; i < elem_count; i++) {
+                idx = kfnd_array[i];
+                if (add_iov(c, keys_array[idx].value, keys_array[idx].length) != 0) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+                mc_engine.v1->get_btree_elem_info(mc_engine.v0, c, elem_array[i], &info[i]);
+                /* flags */
+                sprintf(respptr, " %u ", htonl(flag_array[i]));
+                resplen = strlen(respptr);
+                resplen += make_bop_elem_response(respptr + resplen, &info[i]);
+                if ((add_iov(c, respptr, resplen) != 0) ||
+                    (add_iov(c, info[i].value, info[i].nbytes) != 0)) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+                respptr += resplen;
+            }
+#endif
+            if (ret == ENGINE_ENOMEM) break;
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            sprintf(respptr, "MISSED_KEYS %u\r\n", smres.miss_count);
+#else
+            sprintf(respptr, "MISSED_KEYS %u\r\n", kmis_count);
+#endif
+            if (add_iov(c, respptr, strlen(respptr)) != 0) {
+                ret = ENGINE_ENOMEM; break;
+            }
+            respptr += strlen(respptr);
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            if (smres.miss_count > 0) {
+                char *str = NULL;
+                for (i = 0; i < smres.miss_count; i++) {
+                    /* the last key string does not have delimiter character */
+                    idx = smres.miss_kinfo[i].kidx;
+                    str = get_smget_miss_response(smres.miss_kinfo[i].code);
+                    if ((add_iov(c, keys_array[idx].value, keys_array[idx].length) != 0) ||
+                        (add_iov(c, str, strlen(str)) != 0)) {
+                        ret = ENGINE_ENOMEM; break;
+                    }
+                }
+                if (ret == ENGINE_ENOMEM) break;
+            }
+
+            sprintf(respptr, "TRIMMED_KEYS %u\r\n", smres.trim_count);
+            if (add_iov(c, respptr, strlen(respptr)) != 0) {
+                ret = ENGINE_ENOMEM; break;
+            }
+            respptr += strlen(respptr);
+
+            if (smres.trim_count > 0) {
+                eitem_info tinfo;
+                for (i = 0; i < smres.trim_count; i++) {
+                    mc_engine.v1->get_btree_elem_info(mc_engine.v0, c,
+                                                      smres.trim_elems[i], &tinfo);
+                    resplen = make_smget_trim_response(respptr, &tinfo);
+                    idx = smres.trim_kinfo[i].kidx;
+                    if ((add_iov(c, keys_array[idx].value, keys_array[idx].length) != 0) ||
+                        (add_iov(c, respptr, resplen) != 0)) {
+                        ret = ENGINE_ENOMEM; break;
+                    }
+                    respptr += resplen;
+                }
+                if (ret == ENGINE_ENOMEM) break;
+            }
+
+            sprintf(respptr, (smres.duplicated ? "DUPLICATED\r\n" : "END\r\n"));
+#else
+            if (kmis_count > 0) {
+                sprintf(respptr, "\r\n"); resplen = 2;
+                for (i = 0; i < kmis_count; i++) {
+                    /* the last key string does not have delimiter character */
+                    idx = kmis_array[i];
+                    if ((add_iov(c, keys_array[idx].value, keys_array[idx].length) != 0) ||
+                        (add_iov(c, respptr, resplen) != 0)) {
+                        ret = ENGINE_ENOMEM; break;
+                    }
+                }
+                respptr += resplen;
+                if (ret == ENGINE_ENOMEM) break;
+            }
+
+            if (trimmed == true) {
+                sprintf(respptr, (duplicated ? "DUPLICATED_TRIMMED\r\n" : "TRIMMED\r\n"));
+            } else {
+                sprintf(respptr, (duplicated ? "DUPLICATED\r\n" : "END\r\n"));
+            }
+#endif
+            if ((add_iov(c, respptr, strlen(respptr)) != 0) ||
+                (IS_UDP(c->transport) && build_udp_headers(c) != 0)) {
+                ret = ENGINE_ENOMEM; break;
+            }
+        } while(0);
+
+        if (ret == ENGINE_SUCCESS) {
+            STATS_NOKEY2(c, cmd_bop_smget, bop_smget_oks);
+            /* Remember this command so we can garbage collect it later */
+            /* c->coll_eitem  = (void *)elem_array; */
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            c->coll_ecount = smres.elem_count+smres.trim_count;
+#else
+            c->coll_ecount = elem_count;
+#endif
+            c->coll_op     = OPERATION_BOP_SMGET;
+            conn_set_state(c, conn_mwrite);
+            c->msgcurr     = 0;
+        } else {
+            STATS_NOKEY(c, cmd_bop_smget);
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            mc_engine.v1->btree_elem_release(mc_engine.v0, c, smres.elem_array,
+                                             smres.elem_count+smres.trim_count);
+#else
+            mc_engine.v1->btree_elem_release(mc_engine.v0, c, elem_array, elem_count);
+#endif
+            out_string(c, "SERVER_ERROR out of memory writing get response");
+        }
+        }
+        break;
+    case ENGINE_DISCONNECT:
+        c->state = conn_closing;
+        break;
+    default:
+        STATS_NOKEY(c, cmd_bop_smget);
+        if (ret == ENGINE_EBADVALUE)     out_string(c, "CLIENT_ERROR bad data chunk");
+        else if (ret == ENGINE_EBADTYPE) out_string(c, "TYPE_MISMATCH");
+        else if (ret == ENGINE_EBADBKEY) out_string(c, "BKEY_MISMATCH");
+        else if (ret == ENGINE_EBADATTR) out_string(c, "ATTR_MISMATCH");
+#ifdef JHPARK_NEW_SMGET_INTERFACE // JHPARK_SMGET_OFFSET_HANDLING
+#else
+        else if (ret == ENGINE_EBKEYOOR) out_string(c, "OUT_OF_RANGE");
+#endif
         else out_string(c, "SERVER_ERROR internal");
     }
 
@@ -2079,7 +2455,7 @@ static void complete_update_ascii(conn *c) {
             out_string(c, "CLIENT_ERROR value too big");
             break;
         case ENGINE_EACCESS:
-            out_string(c, "CLIENt_ERROR access control violation");
+            out_string(c, "CLIENT_ERROR access control violation");
             break;
         case ENGINE_NOT_MY_VBUCKET:
             out_string(c, "SERVER_ERROR not my vbucket");
@@ -2958,8 +3334,8 @@ static void bin_read_chunk(conn *c, enum bin_substates next_substate, uint32_t c
             char *newm = realloc(c->rbuf, nsize);
             if (newm == NULL) {
                 if (settings.verbose) {
-                    mc_logger->log(EXTENSION_LOG_INFO, c,
-                        "%d: Failed to grow buffer.. closing connection\n", c->sfd);
+                    mc_logger->log(EXTENSION_LOG_WARNING, c,
+                        "%d: Failed to grow buffer. closing connection\n", c->sfd);
                 }
                 conn_set_state(c, conn_closing);
                 return;
@@ -3323,7 +3699,7 @@ static void process_bin_lop_prepare_nread(conn *c) {
     if ((vlen + 2) > MAX_ELEMENT_BYTES) {
         ret = ENGINE_E2BIG;
     } else {
-        ret = mc_engine.v1->list_elem_alloc(mc_engine.v0, c, &elem, vlen + 2);
+        ret = mc_engine.v1->list_elem_alloc(mc_engine.v0, c, key, nkey, vlen+2, &elem);
     }
 
     if (settings.detail_enabled && ret != ENGINE_SUCCESS) {
@@ -3747,7 +4123,7 @@ static void process_bin_sop_prepare_nread(conn *c) {
         ret = ENGINE_E2BIG;
     } else {
         if (c->cmd == PROTOCOL_BINARY_CMD_SOP_INSERT) {
-            ret = mc_engine.v1->set_elem_alloc(mc_engine.v0, c, &elem, vlen + 2);
+            ret = mc_engine.v1->set_elem_alloc(mc_engine.v0, c, key, nkey, vlen+2, &elem);
         } else { /* PROTOCOL_BINARY_CMD_SOP_DELETE or PROTOCOL_BINARY_CMD_SOP_EXIST */
             if ((elem = (eitem *)malloc(sizeof(elem_value) + vlen + 2)) == NULL)
                 ret = ENGINE_ENOMEM;
@@ -4260,9 +4636,10 @@ static void process_bin_bop_prepare_nread(conn *c) {
     if ((vlen + 2) > MAX_ELEMENT_BYTES) {
         ret = ENGINE_E2BIG;
     } else {
-        ret = mc_engine.v1->btree_elem_alloc(mc_engine.v0, c, &elem,
+        ret = mc_engine.v1->btree_elem_alloc(mc_engine.v0, c, key, nkey,
                                              req->message.body.nbkey,
-                                             req->message.body.neflag, vlen + 2);
+                                             req->message.body.neflag, vlen+2,
+                                             &elem);
     }
 
     if (settings.detail_enabled && ret != ENGINE_SUCCESS) {
@@ -4604,13 +4981,14 @@ static void process_bin_bop_delete(conn *c) {
     }
 
     uint32_t del_count;
+    uint32_t acc_count; /* access count */
     bool     dropped;
 
     ENGINE_ERROR_CODE ret;
     ret = mc_engine.v1->btree_elem_delete(mc_engine.v0, c, key, nkey,
                                           bkrange, efilter, req->message.body.count,
                                           (bool)req->message.body.drop,
-                                          &del_count, &dropped,
+                                          &del_count, &acc_count, &dropped,
                                           c->binary_header.request.vbucket);
     if (ret == ENGINE_EWOULDBLOCK) {
         c->ewouldblock = true;
@@ -4689,6 +5067,7 @@ static void process_bin_bop_get(conn *c) {
 
     eitem  **elem_array = NULL;
     uint32_t elem_count;
+    uint32_t access_count;
     uint32_t flags, i;
     bool     dropped_trimmed;
     int      est_count;
@@ -4713,7 +5092,8 @@ static void process_bin_bop_get(conn *c) {
                                        req->message.body.count,
                                        (bool)req->message.body.delete,
                                        (bool)req->message.body.drop,
-                                       elem_array, &elem_count, &flags, &dropped_trimmed,
+                                       elem_array, &elem_count, &access_count,
+                                       &flags, &dropped_trimmed,
                                        c->binary_header.request.vbucket);
     if (ret == ENGINE_EWOULDBLOCK) {
         c->ewouldblock = true;
@@ -4850,11 +5230,12 @@ static void process_bin_bop_count(conn *c) {
     }
 
     uint32_t elem_count;
-    uint32_t flags;
+    uint32_t access_count;
+    uint32_t flags = 0;
 
     ENGINE_ERROR_CODE ret;
     ret = mc_engine.v1->btree_elem_count(mc_engine.v0, c, key, nkey,
-                                         bkrange, efilter, &elem_count, &flags,
+                                         bkrange, efilter, &elem_count, &access_count,
                                          c->binary_header.request.vbucket);
 
     if (settings.detail_enabled) {
@@ -4964,9 +5345,10 @@ static void process_bin_bop_prepare_nread_keys(conn *c) {
 #endif
 #ifdef SUPPORT_BOP_SMGET
         if (c->cmd == PROTOCOL_BINARY_CMD_BOP_SMGET) {
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+          if (c->coll_smgmode == 0) {
             int smget_count;
             int elem_array_size; /* elem pointer array where the found elements will be saved */
-            int keys_array_size; /* keyinfo(token_t) array where the address and length of keys are to be saved */
             int kmis_array_size; /* key index array where the missed key indexes are to be saved */
             int elem_rshdr_size; /* the size of result header about the found elems */
             int kmis_rshdr_size; /* the size of result header about the missed keys */
@@ -4977,12 +5359,49 @@ static void process_bin_bop_prepare_nread_keys(conn *c) {
             }
             smget_count = req->message.body.req_offset + req->message.body.req_count;
             elem_array_size = smget_count * (sizeof(eitem*) + (2*sizeof(uint32_t)));
-            keys_array_size = req->message.body.key_count * sizeof(token_t);
             kmis_array_size = req->message.body.key_count * sizeof(uint32_t);
             elem_rshdr_size = smget_count * (sizeof(uint64_t) + (3*sizeof(uint32_t)));
             kmis_rshdr_size = req->message.body.key_count * sizeof(uint32_t);
+            need_size = elem_array_size + kmis_array_size + elem_rshdr_size + kmis_rshdr_size;
+          } else {
+#endif
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            int elem_array_size; /* smget element array size */
+            int ehit_array_size; /* smget hitted elem array size */
+            int emis_array_size; /* element missed keys array size */
+            int elem_rshdr_size; /* the size of result header about the found elems */
+            int emis_rshdr_size; /* the size of result header about the missed keys */
+#else
+            int smget_count;
+            int elem_array_size; /* elem pointer array where the found elements will be saved */
+            int kmis_array_size; /* key index array where the missed key indexes are to be saved */
+            int elem_rshdr_size; /* the size of result header about the found elems */
+            int kmis_rshdr_size; /* the size of result header about the missed keys */
+#endif
 
-            need_size = elem_array_size + keys_array_size + kmis_array_size + elem_rshdr_size + kmis_rshdr_size;
+            if (req->message.body.key_count > MAX_SMGET_KEY_COUNT ||
+                (req->message.body.req_offset + req->message.body.req_count) > MAX_SMGET_REQ_COUNT) {
+                ret = ENGINE_EBADVALUE; break;
+            }
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            elem_array_size = (req->message.body.req_count + req->message.body.key_count) * sizeof(eitem*);
+            ehit_array_size = req->message.body.req_count * sizeof(smget_ehit_t);
+            emis_array_size = req->message.body.key_count * sizeof(smget_emis_t);
+            elem_rshdr_size = req->message.body.req_count * (sizeof(uint64_t) + (3*sizeof(uint32_t)));
+            emis_rshdr_size = req->message.body.key_count * sizeof(uint32_t);
+            need_size = elem_array_size + ehit_array_size + emis_array_size
+                      + elem_rshdr_size + emis_rshdr_size;
+#else
+            smget_count = req->message.body.req_offset + req->message.body.req_count;
+            elem_array_size = smget_count * (sizeof(eitem*) + (2*sizeof(uint32_t)));
+            kmis_array_size = req->message.body.key_count * sizeof(uint32_t);
+            elem_rshdr_size = smget_count * (sizeof(uint64_t) + (3*sizeof(uint32_t)));
+            kmis_rshdr_size = req->message.body.key_count * sizeof(uint32_t);
+            need_size = elem_array_size + kmis_array_size + elem_rshdr_size + kmis_rshdr_size;
+#endif
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+          }
+#endif
         }
 #endif
         assert(need_size > 0);
@@ -4990,7 +5409,9 @@ static void process_bin_bop_prepare_nread_keys(conn *c) {
         if ((elem = (eitem *)malloc(need_size)) == NULL) {
             ret = ENGINE_ENOMEM;
         } else {
-            if ((c->coll_mkeys = malloc(vlen+2)) == NULL) {
+            int kmem_size = GET_8ALIGN_SIZE(vlen+2)
+                          + (sizeof(token_t) * req->message.body.key_count);
+            if ((c->coll_mkeys = malloc(kmem_size)) == NULL) {
                 free((void*)elem);
                 ret = ENGINE_ENOMEM;
             } else {
@@ -5053,14 +5474,14 @@ static void process_bin_bop_mget_complete(conn *c) {
 #endif
 
 #ifdef SUPPORT_BOP_SMGET
-static void process_bin_bop_smget_complete(conn *c) {
-    assert(c->coll_eitem != NULL);
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+static void process_bin_bop_smget_complete_old(conn *c) {
     int smget_count = c->coll_roffset + c->coll_rcount;
-    int elem_array_size = smget_count * (sizeof(eitem*) + (2*sizeof(uint32_t)));
-    int keys_array_size = c->coll_numkeys * sizeof(token_t);
     int kmis_array_size = c->coll_numkeys * sizeof(uint32_t);
+    char *resultptr;
     char *vptr = (char*)c->coll_mkeys;
     char delimiter = ',';
+    token_t *keys_array = (token_t*)(vptr + GET_8ALIGN_SIZE(c->coll_lenkeys));
 
     /* We don't actually receive the trailing two characters in the bin
      * protocol, so we're going to just set them here */
@@ -5071,8 +5492,9 @@ static void process_bin_bop_smget_complete(conn *c) {
     eitem   **elem_array = (eitem  **)c->coll_eitem;
     uint32_t *kfnd_array = (uint32_t*)((char*)elem_array + (smget_count*sizeof(eitem*)));
     uint32_t *flag_array = (uint32_t*)((char*)kfnd_array + (smget_count*sizeof(uint32_t)));
-    token_t  *keys_array = (token_t *)((char*)elem_array + elem_array_size);
-    uint32_t *kmis_array = (uint32_t*)((char*)keys_array + keys_array_size);
+    uint32_t *kmis_array = (uint32_t*)((char*)flag_array + (smget_count*sizeof(uint32_t)));
+
+    resultptr = ((char *)kmis_array + kmis_array_size);
 
     bool trimmed;
     bool duplicated;
@@ -5087,7 +5509,7 @@ static void process_bin_bop_smget_complete(conn *c) {
                    (c->coll_bkrange.from_nbkey==0 ? sizeof(uint64_t) : c->coll_bkrange.from_nbkey));
             c->coll_bkrange.to_nbkey = c->coll_bkrange.from_nbkey;
         }
-        ret = mc_engine.v1->btree_elem_smget(mc_engine.v0, c,
+        ret = mc_engine.v1->btree_elem_smget_old(mc_engine.v0, c,
                                      keys_array, c->coll_numkeys,
                                      &c->coll_bkrange,
                                      (c->coll_efilter.ncompval==0 ? NULL : &c->coll_efilter),
@@ -5104,7 +5526,6 @@ static void process_bin_bop_smget_complete(conn *c) {
         uint32_t real_elem_hdr_size = elem_count * (sizeof(uint64_t) + (3*sizeof(uint32_t)));
         uint32_t real_kmis_hdr_size = kmis_count * sizeof(uint32_t);
         uint32_t bodylen, i;
-        char     *resultptr = (char*)kmis_array + kmis_array_size;
         uint64_t *bkeyptr;
         uint32_t *vlenptr;
         uint32_t *flagptr;
@@ -5135,7 +5556,11 @@ static void process_bin_bop_smget_complete(conn *c) {
 
         // add the flags and count
         rsp->message.body.elem_count = htonl(elem_count);
+#if 1 /* JHPARK_NEW_SMGET_INTERFACE */
+        rsp->message.body.miss_count = htonl(kmis_count);
+#else
         rsp->message.body.kmis_count = htonl(kmis_count);
+#endif
         add_iov(c, &rsp->message.body, sizeof(rsp->message.body));
 
         // add value lengths
@@ -5208,6 +5633,314 @@ static void process_bin_bop_smget_complete(conn *c) {
             write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EBADATTR, 0);
         else if (ret == ENGINE_EBKEYOOR)
             write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EBKEYOOR, 0);
+        else
+            write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EINTERNAL, 0);
+    }
+
+    if (ret != ENGINE_SUCCESS) {
+        if (c->coll_mkeys != NULL) {
+            free((void *)c->coll_mkeys);
+            c->coll_mkeys = NULL;
+        }
+        if (c->coll_eitem != NULL) {
+            free((void *)c->coll_eitem);
+            c->coll_eitem = NULL;
+        }
+    }
+}
+#endif
+
+static void process_bin_bop_smget_complete(conn *c) {
+    assert(c->coll_eitem != NULL);
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+    if (c->coll_smgmode == 0) {
+        process_bin_bop_smget_complete_old(c);
+        return;
+    }
+#endif
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    smget_result_t smres;
+#else
+    int smget_count = c->coll_roffset + c->coll_rcount;
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+#else
+    int elem_array_size = smget_count * (sizeof(eitem*) + (2*sizeof(uint32_t)));
+#endif
+    int kmis_array_size = c->coll_numkeys * sizeof(uint32_t);
+#endif
+    char *resultptr;
+    char *vptr = (char*)c->coll_mkeys;
+    char delimiter = ',';
+    token_t *keys_array = (token_t*)(vptr + GET_8ALIGN_SIZE(c->coll_lenkeys));
+
+    /* We don't actually receive the trailing two characters in the bin
+     * protocol, so we're going to just set them here */
+    memcpy(vptr + c->coll_lenkeys - 2, "\r\n", 2);
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    smres.elem_array = (eitem **)c->coll_eitem;
+    smres.elem_kinfo = (smget_ehit_t *)&smres.elem_array[c->coll_rcount+c->coll_numkeys];
+    smres.miss_kinfo = (smget_emis_t *)&smres.elem_kinfo[c->coll_rcount];
+
+    resultptr = (char *)&smres.miss_kinfo[c->coll_numkeys];
+#else
+    uint32_t  kmis_count = 0;
+    uint32_t  elem_count = 0;
+    eitem   **elem_array = (eitem  **)c->coll_eitem;
+    uint32_t *kfnd_array = (uint32_t*)((char*)elem_array + (smget_count*sizeof(eitem*)));
+    uint32_t *flag_array = (uint32_t*)((char*)kfnd_array + (smget_count*sizeof(uint32_t)));
+    uint32_t *kmis_array = (uint32_t*)((char*)flag_array + (smget_count*sizeof(uint32_t)));
+
+    resultptr = ((char *)kmis_array + kmis_array_size);
+
+    bool trimmed;
+    bool duplicated;
+#endif
+
+    ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
+    int ntokens = tokenize_keys(vptr, delimiter, c->coll_numkeys, keys_array);
+    if (ntokens == -1) {
+        ret = ENGINE_EBADVALUE;
+    } else {
+        if (c->coll_bkrange.to_nbkey == BKEY_NULL) {
+            memcpy(c->coll_bkrange.to_bkey, c->coll_bkrange.from_bkey,
+                   (c->coll_bkrange.from_nbkey==0 ? sizeof(uint64_t) : c->coll_bkrange.from_nbkey));
+            c->coll_bkrange.to_nbkey = c->coll_bkrange.from_nbkey;
+        }
+        ret = mc_engine.v1->btree_elem_smget(mc_engine.v0, c,
+                                     keys_array, c->coll_numkeys,
+                                     &c->coll_bkrange,
+                                     (c->coll_efilter.ncompval==0 ? NULL : &c->coll_efilter),
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+                                     c->coll_roffset, c->coll_rcount,
+                                     (c->coll_smgmode == 2 ? true : false), &smres,
+#else
+                                     c->coll_roffset, c->coll_rcount, c->coll_unique,
+                                     &smres,
+#endif
+#else
+                                     c->coll_roffset, c->coll_rcount,
+                                     elem_array, kfnd_array, flag_array, &elem_count,
+                                     kmis_array, &kmis_count, &trimmed, &duplicated,
+#endif
+                                     c->binary_header.request.vbucket);
+    }
+
+    switch (ret) {
+    case ENGINE_SUCCESS:
+        {
+        protocol_binary_response_bop_smget* rsp = (protocol_binary_response_bop_smget*)c->wbuf;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        uint32_t real_elem_hdr_size = smres.elem_count * (sizeof(uint64_t) + (3*sizeof(uint32_t)));
+        uint32_t real_emis_hdr_size = (smres.miss_count + smres.trim_count) * sizeof(uint32_t);
+        uint32_t bodylen, i;
+#else
+        uint32_t real_elem_hdr_size = elem_count * (sizeof(uint64_t) + (3*sizeof(uint32_t)));
+        uint32_t real_kmis_hdr_size = kmis_count * sizeof(uint32_t);
+        uint32_t bodylen, i;
+#endif
+        uint64_t *bkeyptr;
+        uint32_t *vlenptr;
+        uint32_t *flagptr;
+        uint32_t *klenptr;
+
+        if (((long)resultptr % 8) != 0) /* NOT aligned */
+            resultptr += (8 - ((long)resultptr % 8));
+        bkeyptr = (uint64_t *)resultptr;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        vlenptr = (uint32_t *)((char*)bkeyptr + (sizeof(uint64_t) * smres.elem_count));
+        flagptr = (uint32_t *)((char*)vlenptr + (sizeof(uint32_t) * smres.elem_count));
+        klenptr = (uint32_t *)((char*)flagptr + (sizeof(uint32_t) * smres.elem_count));
+
+        eitem_info info[smres.elem_count+1]; /* elem_count might be 0. */
+        for (i = 0; i < smres.elem_count; i++) {
+            mc_engine.v1->get_btree_elem_info(mc_engine.v0, c, smres.elem_array[i], &info[i]);
+        }
+#else
+        vlenptr = (uint32_t *)((char*)bkeyptr + (sizeof(uint64_t) * elem_count));
+        flagptr = (uint32_t *)((char*)vlenptr + (sizeof(uint32_t) * elem_count));
+        klenptr = (uint32_t *)((char*)flagptr + (sizeof(uint32_t) * elem_count));
+
+        eitem_info info[elem_count+1]; /* elem_count might be 0. */
+        for (i = 0; i < elem_count; i++) {
+            mc_engine.v1->get_btree_elem_info(mc_engine.v0, c, elem_array[i], &info[i]);
+        }
+#endif
+
+        bodylen = sizeof(rsp->message.body);
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        bodylen += (real_elem_hdr_size + real_emis_hdr_size);
+        for (i = 0; i < smres.elem_count; i++) {
+             bodylen += (info[i].nbytes - 2);
+             bodylen += keys_array[smres.elem_kinfo[i].kidx].length;
+        }
+        for (i = 0; i < smres.miss_count; i++) {
+             bodylen += keys_array[smres.miss_kinfo[i].kidx].length;
+        }
+        for (i = 0; i < smres.trim_count; i++) {
+             bodylen += keys_array[smres.trim_kinfo[i].kidx].length;
+        }
+        add_bin_header(c, 0, sizeof(rsp->message.body), 0, bodylen);
+
+        // add the flags and count
+        rsp->message.body.elem_count = htonl(smres.elem_count);
+        rsp->message.body.miss_count = htonl(smres.miss_count);
+        rsp->message.body.trim_count = htonl(smres.trim_count);
+#else
+        bodylen += (real_elem_hdr_size + real_kmis_hdr_size);
+        for (i = 0; i < elem_count; i++) {
+             bodylen += (info[i].nbytes - 2);
+             bodylen += keys_array[kfnd_array[i]].length;
+        }
+        for (i = 0; i < kmis_count; i++) {
+             bodylen += keys_array[kmis_array[i]].length;
+        }
+        add_bin_header(c, 0, sizeof(rsp->message.body), 0, bodylen);
+
+        // add the flags and count
+        rsp->message.body.elem_count = htonl(elem_count);
+        rsp->message.body.kmis_count = htonl(kmis_count);
+#endif
+        add_iov(c, &rsp->message.body, sizeof(rsp->message.body));
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        // add value lengths
+        for (i = 0; i < smres.elem_count; i++) {
+             bkeyptr[i] = htonll(*(uint64_t*)info[i].score);
+             vlenptr[i] = htonl(info[i].nbytes - 2);
+             flagptr[i] = smres.elem_kinfo[i].flag;
+             klenptr[i] = htonl(keys_array[smres.elem_kinfo[i].kidx].length);
+        }
+        for (i = 0; i < smres.miss_count; i++) {
+             klenptr[smres.elem_count+i] = htonl(keys_array[smres.miss_kinfo[i].kidx].length);
+        }
+        for (i = 0; i < smres.trim_count; i++) {
+             klenptr[smres.elem_count+smres.miss_count+i] = htonl(keys_array[smres.trim_kinfo[i].kidx].length);
+        }
+        if (add_iov(c, (char*)bkeyptr, real_elem_hdr_size+real_emis_hdr_size) != 0) {
+            ret = ENGINE_ENOMEM;
+        }
+
+        /* Add the data without CRLF */
+        if (ret == ENGINE_SUCCESS) {
+            for (i = 0; i < smres.elem_count; i++) {
+                if (add_iov(c, info[i].value, info[i].nbytes - 2) != 0) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+            }
+        }
+        /* Add the found key */
+        if (ret == ENGINE_SUCCESS) {
+            for (i = 0; i < smres.elem_count; i++) {
+                if (add_iov(c, keys_array[smres.elem_kinfo[i].kidx].value,
+                               keys_array[smres.elem_kinfo[i].kidx].length) != 0) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+            }
+        }
+        /* Add the missed key */
+        if (ret == ENGINE_SUCCESS) {
+            for (i = 0; i < smres.miss_count; i++) {
+                if (add_iov(c, keys_array[smres.miss_kinfo[i].kidx].value,
+                               keys_array[smres.miss_kinfo[i].kidx].length) != 0) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+            }
+        }
+        /* Add the trimmed key */
+        if (ret == ENGINE_SUCCESS) {
+            for (i = 0; i < smres.trim_count; i++) {
+                if (add_iov(c, keys_array[smres.trim_kinfo[i].kidx].value,
+                               keys_array[smres.trim_kinfo[i].kidx].length) != 0) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+            }
+        }
+#else
+        // add value lengths
+        for (i = 0; i < elem_count; i++) {
+             bkeyptr[i] = htonll(*(uint64_t*)info[i].score);
+             vlenptr[i] = htonl(info[i].nbytes - 2);
+             flagptr[i] = flag_array[i];
+             klenptr[i] = htonl(keys_array[kfnd_array[i]].length);
+        }
+        for (i = 0; i < kmis_count; i++) {
+             klenptr[elem_count+i] = htonl(keys_array[kmis_array[i]].length);
+        }
+        if (add_iov(c, (char*)bkeyptr, real_elem_hdr_size+real_kmis_hdr_size) != 0) {
+            ret = ENGINE_ENOMEM;
+        }
+
+        /* Add the data without CRLF */
+        if (ret == ENGINE_SUCCESS) {
+            for (i = 0; i < elem_count; i++) {
+                if (add_iov(c, info[i].value, info[i].nbytes - 2) != 0) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+            }
+        }
+        /* Add the found key */
+        if (ret == ENGINE_SUCCESS) {
+            for (i = 0; i < elem_count; i++) {
+                if (add_iov(c, keys_array[kfnd_array[i]].value,
+                               keys_array[kfnd_array[i]].length) != 0) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+            }
+        }
+        /* Add the missed key */
+        if (ret == ENGINE_SUCCESS) {
+            for (i = 0; i < kmis_count; i++) {
+                if (add_iov(c, keys_array[kmis_array[i]].value,
+                               keys_array[kmis_array[i]].length) != 0) {
+                    ret = ENGINE_ENOMEM; break;
+                }
+            }
+        }
+#endif
+
+        if (ret == ENGINE_SUCCESS) {
+            /* Remember this command so we can garbage collect it later */
+            /* c->coll_eitem  = (void *)elem_array; */
+            STATS_NOKEY2(c, cmd_bop_smget, bop_smget_oks);
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            c->coll_ecount = smres.elem_count+smres.trim_count;
+#else
+            c->coll_ecount = elem_count;
+#endif
+            c->coll_op     = OPERATION_BOP_SMGET;
+            conn_set_state(c, conn_mwrite);
+        } else {
+            STATS_NOKEY(c, cmd_bop_smget);
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            mc_engine.v1->btree_elem_release(mc_engine.v0, c, smres.elem_array,
+                                             smres.elem_count+smres.trim_count);
+#else
+            mc_engine.v1->btree_elem_release(mc_engine.v0, c, elem_array, elem_count);
+#endif
+            write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_ENOMEM, 0);
+        }
+        }
+        break;
+    case ENGINE_DISCONNECT:
+        c->state = conn_closing;
+        break;
+    default:
+        STATS_NOKEY(c, cmd_bop_smget);
+        if (ret == ENGINE_EBADVALUE)
+            write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EBADVALUE, 0);
+        else if (ret == ENGINE_EBADTYPE)
+            write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EBADTYPE, 0);
+        else if (ret == ENGINE_EBADBKEY)
+            write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EBADBKEY, 0);
+        else if (ret == ENGINE_EBADATTR)
+            write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EBADATTR, 0);
+#ifdef JHPARK_NEW_SMGET_INTERFACE // JHPARK_SMGET_OFFSET_HANDLING
+#else
+        else if (ret == ENGINE_EBKEYOOR)
+            write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EBKEYOOR, 0);
+#endif
         else
             write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_EINTERNAL, 0);
     }
@@ -6288,6 +7021,12 @@ static void reset_cmd_handler(conn *c) {
         mc_engine.v1->release(mc_engine.v0, c, c->item);
         c->item = NULL;
     }
+#ifdef DETECT_LONG_QUERY
+    if (c->lq_bufcnt != 0) {
+        lqdetect_buffer_release(c->lq_bufcnt);
+        c->lq_bufcnt = 0;
+    }
+#endif
     if (c->coll_eitem != NULL) {
         conn_coll_eitem_free(c);
     }
@@ -6451,6 +7190,35 @@ static void write_and_free(conn *c, char *buf, int bytes) {
     }
 }
 
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+static inline int set_smget_mode_maybe(conn *c, token_t *tokens, size_t ntokens)
+{
+    int mode_index = ntokens - 2;
+    int mode_value = 0;
+
+    if (tokens[mode_index].value) {
+        if (strcmp(tokens[mode_index].value, "duplicate") == 0)
+            mode_value = 1;
+        else if (strcmp(tokens[mode_index].value, "unique") == 0)
+            mode_value = 2;
+    }
+    return mode_value;
+}
+#else
+static inline bool set_unique_maybe(conn *c, token_t *tokens, size_t ntokens)
+{
+    int unique_index = ntokens - 2;
+
+    if (tokens[unique_index].value
+        && strcmp(tokens[unique_index].value, "unique") == 0)
+        return true;
+    else
+        return false;
+}
+#endif
+#endif
+
 static inline bool set_noreply_maybe(conn *c, token_t *tokens, size_t ntokens)
 {
     int noreply_index = ntokens - 2;
@@ -6511,6 +7279,30 @@ static inline bool set_pipe_maybe(conn *c, token_t *tokens, size_t ntokens)
         }
     }
     return c->noreply;
+}
+
+static bool check_and_handle_pipe_state(conn *c, size_t swallow)
+{
+    if (c->pipe_state == PIPE_STATE_OFF || c->pipe_state == PIPE_STATE_ON) {
+        return true;
+    } else {
+        assert(c->pipe_state == PIPE_STATE_ERR_CFULL ||
+               c->pipe_state == PIPE_STATE_ERR_MFULL ||
+               c->pipe_state == PIPE_STATE_ERR_BAD);
+        if (c->noreply == true) {
+            c->noreply = false; /* reset noreply */
+        } else  {
+            /* The last command of pipelining has come. */
+            /* clear pipe_state: the end of pipe */
+            c->pipe_state = PIPE_STATE_OFF;
+            c->pipe_count = 0;
+        }
+        if (swallow > 0) {
+            c->sbytes = swallow;
+            conn_set_state(c, conn_swallow);
+        }
+        return false;
+    }
 }
 
 void append_stat(const char *name, ADD_STAT add_stats, conn *c,
@@ -6681,6 +7473,8 @@ static void server_stats(ADD_STAT add_stats, conn *c, bool aggregate) {
 
     APPEND_STAT("daemon_connections", "%u", mc_stats.daemon_conns);
     APPEND_STAT("curr_connections", "%u", mc_stats.curr_conns);
+    APPEND_STAT("quit_connections", "%u", mc_stats.quit_conns);
+    APPEND_STAT("reject_connections", "%u", mc_stats.rejected_conns);
     APPEND_STAT("total_connections", "%u", mc_stats.total_conns);
     APPEND_STAT("connection_structures", "%u", mc_stats.conn_structs);
     APPEND_STAT("cmd_get", "%"PRIu64, thread_stats.cmd_get);
@@ -6790,7 +7584,6 @@ static void server_stats(ADD_STAT add_stats, conn *c, bool aggregate) {
     APPEND_STAT("bytes_read", "%"PRIu64, thread_stats.bytes_read);
     APPEND_STAT("bytes_written", "%"PRIu64, thread_stats.bytes_written);
     APPEND_STAT("limit_maxbytes", "%"PRIu64, settings.maxbytes);
-    APPEND_STAT("rejected_conns", "%" PRIu64, (unsigned long long)mc_stats.rejected_conns);
     APPEND_STAT("threads", "%d", settings.num_threads);
     APPEND_STAT("conn_yields", "%" PRIu64, (unsigned long long)thread_stats.conn_yields);
     STATS_UNLOCK();
@@ -6838,6 +7631,9 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
 #endif
     APPEND_STAT("auth_required_sasl", "%s", settings.require_sasl ? "yes" : "no");
     APPEND_STAT("item_size_max", "%d", settings.item_size_max);
+    APPEND_STAT("max_list_size", "%d", settings.max_list_size);
+    APPEND_STAT("max_set_size", "%d", settings.max_set_size);
+    APPEND_STAT("max_btree_size", "%d", settings.max_btree_size);
     APPEND_STAT("topkeys", "%d", settings.topkeys);
 
     for (EXTENSION_DAEMON_DESCRIPTOR *ptr = settings.extensions.daemons;
@@ -6932,7 +7728,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
         if (tk != NULL) {
             topkeys_stats(tk, c, current_time, append_stats);
         } else {
-            out_string(c, "ERROR");
+            out_string(c, "SERVER_ERROR not supported");
             return;
         }
     } else if (strcmp(subcommand, "prefixes") == 0) {
@@ -6977,7 +7773,7 @@ static void process_stat(conn *c, token_t *tokens, const size_t ntokens) {
             out_string(c, "SERVER_ERROR not supported");
             break;
         default:
-            out_string(c, "ERROR");
+            out_string(c, "ERROR no matching stat");
             break;
         }
         return ;
@@ -7278,6 +8074,9 @@ static void process_update_command(conn *c, token_t *tokens, const size_t ntoken
         break;
     default:
         handle_unexpected_errorcode_ascii(c, ret);
+        /* swallow the data line */
+        c->write_and_go = conn_swallow;
+        c->sbytes = vlen;
     }
 }
 
@@ -7619,6 +8418,64 @@ static void process_maxconns_command(conn *c, token_t *tokens, const size_t ntok
     }
 }
 
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+static void process_maxcollsize_command(conn *c, token_t *tokens, const size_t ntokens,
+                                        int coll_type)
+{
+    assert(coll_type==ITEM_TYPE_LIST || coll_type==ITEM_TYPE_SET ||
+           coll_type==ITEM_TYPE_BTREE);
+    assert(c != NULL);
+    int32_t maxsize;
+
+    if (ntokens == 3) {
+        char buf[50];
+        switch (coll_type) {
+          case ITEM_TYPE_LIST:
+               sprintf(buf, "max_list_size %d\r\nEND", settings.max_list_size);
+               break;
+          case ITEM_TYPE_SET:
+               sprintf(buf, "max_set_size %d\r\nEND", settings.max_set_size);
+               break;
+          case ITEM_TYPE_BTREE:
+               sprintf(buf, "max_btree_size %d\r\nEND", settings.max_btree_size);
+               break;
+        }
+        out_string(c, buf);
+    }
+    else if (ntokens == 4 && safe_strtol(tokens[COMMAND_TOKEN+2].value, &maxsize)) {
+        ENGINE_ERROR_CODE ret;
+
+        SETTING_LOCK();
+        ret = mc_engine.v1->set_maxcollsize(mc_engine.v0, c, coll_type, &maxsize);
+        if (ret == ENGINE_SUCCESS) {
+            switch (coll_type) {
+              case ITEM_TYPE_LIST:
+                   settings.max_list_size = maxsize;
+                   MAX_LIST_SIZE = maxsize;
+                   break;
+              case ITEM_TYPE_SET:
+                   settings.max_set_size = maxsize;
+                   MAX_SET_SIZE = maxsize;
+                   break;
+              case ITEM_TYPE_BTREE:
+                   settings.max_btree_size = maxsize;
+                   MAX_BTREE_SIZE = maxsize;
+                   break;
+            }
+        }
+        SETTING_UNLOCK();
+        if (ret == ENGINE_SUCCESS) {
+            out_string(c, "END");
+        } else { /* ENGINE_EBADVALUE */
+            out_string(c, "CLIENT_ERROR bad value");
+        }
+    }
+    else {
+        out_string(c, "CLIENT_ERROR bad command line format");
+    }
+}
+#endif
+
 #ifdef ENABLE_ZK_INTEGRATION
 static void process_hbtimeout_command(conn *c, token_t *tokens, const size_t ntokens) {
     unsigned int hbtimeout;
@@ -7669,6 +8526,23 @@ static void process_config_command(conn *c, token_t *tokens, const size_t ntoken
     {
         process_memlimit_command(c, tokens, ntokens);
     }
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    else if ((ntokens == 3 || ntokens == 4) &&
+             (strcmp(tokens[SUBCOMMAND_TOKEN].value, "max_list_size") == 0))
+    {
+        process_maxcollsize_command(c, tokens, ntokens, ITEM_TYPE_LIST);
+    }
+    else if ((ntokens == 3 || ntokens == 4) &&
+             (strcmp(tokens[SUBCOMMAND_TOKEN].value, "max_set_size") == 0))
+    {
+        process_maxcollsize_command(c, tokens, ntokens, ITEM_TYPE_SET);
+    }
+    else if ((ntokens == 3 || ntokens == 4) &&
+             (strcmp(tokens[SUBCOMMAND_TOKEN].value, "max_btree_size") == 0))
+    {
+        process_maxcollsize_command(c, tokens, ntokens, ITEM_TYPE_BTREE);
+    }
+#endif
 #ifdef ENABLE_ZK_INTEGRATION
     else if ((ntokens == 3 || ntokens == 4) &&
              (strcmp(tokens[SUBCOMMAND_TOKEN].value, "hbtimeout") == 0))
@@ -7723,6 +8597,64 @@ static void process_zk_ensemble_command(conn *c, token_t *tokens, const size_t n
 }
 #endif
 
+#ifdef JHPARK_KEY_DUMP
+static void process_dump_command(conn *c, token_t *tokens, const size_t ntokens)
+{
+    char *opstr;
+    char *modestr = NULL;
+    char *filepath = NULL;
+    char *prefix = NULL;
+    int  nprefix = -1; /* all prefixes */
+
+    /* dump ascii command
+     * dump start key [<prefix>] filepath\r\n
+     * dump stop\r\n
+     */
+    opstr = tokens[1].value;
+    if (ntokens == 3) {
+        if (memcmp(opstr, "stop", 4) != 0) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+    } else if (ntokens == 5 || ntokens == 6) {
+        modestr = tokens[2].value;
+        if (memcmp(opstr, "start", 5) != 0 || memcmp(modestr, "key", 3) != 0) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+        if (ntokens == 5) {
+            filepath = tokens[3].value;
+        } else {
+            prefix = tokens[3].value;
+            nprefix = tokens[3].length;
+            if (nprefix == 4 && strncmp(prefix, "null", 4) == 0) { /* null prefix */
+                prefix = NULL;
+                nprefix = 0;
+            }
+            filepath = tokens[4].value;
+        }
+    } else {
+        out_string(c, "CLIENT_ERROR bad command line format");
+        return;
+    }
+
+    ENGINE_ERROR_CODE ret;
+    ret = mc_engine.v1->dump(mc_engine.v0, c, opstr, modestr,
+                             prefix, nprefix, filepath);
+    if (ret == ENGINE_SUCCESS) {
+        out_string(c, "OK");
+    } else if (ret == ENGINE_DISCONNECT) {
+        c->state = conn_closing;
+    } else if (ret == ENGINE_ENOTSUP) {
+        out_string(c, "SERVER_ERROR not supported");
+    } else if (ret == ENGINE_FAILED) {
+        out_string(c, "SERVER_ERROR failed. refer to the reason in server log.");
+    } else {
+        handle_unexpected_errorcode_ascii(c, ret);
+    }
+}
+#endif
+
 static void process_help_command(conn *c, token_t *tokens, const size_t ntokens)
 {
     char *type = tokens[COMMAND_TOKEN+1].value;
@@ -7757,6 +8689,53 @@ static void process_help_command(conn *c, token_t *tokens, const size_t ntokens)
         "\t" "* <attributes> : <flags> <exptime> <maxcount> [<ovflaction>] [unreadable]" "\n"
         );
     } else if (ntokens > 2 && strcmp(type, "btree") == 0) {
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+        out_string(c,
+        "\t" "bop create <key> <attributes> [noreply]\\r\\n" "\n"
+        "\t" "bop insert|upsert <key> <bkey> [<eflag>] <bytes> [create <attributes>] [noreply|pipe|getrim]\\r\\n<data>\\r\\n" "\n"
+        "\t" "bop update <key> <bkey> [<eflag_update>] <bytes> [noreply|pipe]\\r\\n<data>\\r\\n" "\n"
+        "\t" "bop delete <key> <bkey or \"bkey range\"> [<eflag_filter>] [<count>] [drop] [noreply|pipe]\\r\\n" "\n"
+        "\t" "bop get <key> <bkey or \"bkey range\"> [<eflag_filter>] [[<offset>] <count>] [delete|drop]\\r\\n" "\n"
+        "\t" "bop count <key> <bkey or \"bkey range\"> [<eflag_filter>] \\r\\n" "\n"
+        "\t" "bop incr|decr <key> <bkey> <value> [noreply|pipe]\\r\\n" "\n"
+        "\t" "bop mget <lenkeys> <numkeys> <bkey or \"bkey range\"> [<eflag_filter>] [<offset>] <count>\\r\\n<\"comma separated keys\">\\r\\n" "\n"
+        "\t" "bop smget <lenkeys> <numkeys> <bkey or \"bkey range\"> [<eflag_filter>] [<offset>] <count> [duplicate|unique]\\r\\n<\"comma separated keys\">\\r\\n" "\n"
+        "\t" "bop position <key> <bkey> <order>\\r\\n" "\n"
+        "\t" "bop pwg <key> <bkey> <order> [<count>]\\r\\n" "\n"
+        "\t" "bop gbp <key> <order> <position or \"position range\">\\r\\n" "\n"
+        "\n"
+        "\t" "* <attributes> : <flags> <exptime> <maxcount> [<ovflaction>] [unreadable]" "\n"
+        "\t" "* <eflag_update> : [<fwhere> <bitwop>] <fvalue>" "\n"
+        "\t" "* <eflag_filter> : <fwhere> [<bitwop> <foperand>] <compop> <fvalue>" "\n"
+        "\t" "                 : <fwhere> [<bitwop> <foperand>] EQ|NE <comma separated fvalue list>" "\n"
+        "\t" "* <bitwop> : &, |, ^" "\n"
+        "\t" "* <compop> : EQ, NE, LT, LE, GT, GE" "\n"
+        );
+#else
+        out_string(c,
+        "\t" "bop create <key> <attributes> [noreply]\\r\\n" "\n"
+        "\t" "bop insert|upsert <key> <bkey> [<eflag>] <bytes> [create <attributes>] [noreply|pipe|getrim]\\r\\n<data>\\r\\n" "\n"
+        "\t" "bop update <key> <bkey> [<eflag_update>] <bytes> [noreply|pipe]\\r\\n<data>\\r\\n" "\n"
+        "\t" "bop delete <key> <bkey or \"bkey range\"> [<eflag_filter>] [<count>] [drop] [noreply|pipe]\\r\\n" "\n"
+        "\t" "bop get <key> <bkey or \"bkey range\"> [<eflag_filter>] [[<offset>] <count>] [delete|drop]\\r\\n" "\n"
+        "\t" "bop count <key> <bkey or \"bkey range\"> [<eflag_filter>] \\r\\n" "\n"
+        "\t" "bop incr|decr <key> <bkey> <value> [noreply|pipe]\\r\\n" "\n"
+        "\t" "bop mget <lenkeys> <numkeys> <bkey or \"bkey range\"> [<eflag_filter>] [<offset>] <count>\\r\\n<\"comma separated keys\">\\r\\n" "\n"
+        "\t" "bop smget <lenkeys> <numkeys> <bkey or \"bkey range\"> [<eflag_filter>] [<offset>] <count> [unique]\\r\\n<\"comma separated keys\">\\r\\n" "\n"
+        "\t" "bop position <key> <bkey> <order>\\r\\n" "\n"
+        "\t" "bop pwg <key> <bkey> <order> [<count>]\\r\\n" "\n"
+        "\t" "bop gbp <key> <order> <position or \"position range\">\\r\\n" "\n"
+        "\n"
+        "\t" "* <attributes> : <flags> <exptime> <maxcount> [<ovflaction>] [unreadable]" "\n"
+        "\t" "* <eflag_update> : [<fwhere> <bitwop>] <fvalue>" "\n"
+        "\t" "* <eflag_filter> : <fwhere> [<bitwop> <foperand>] <compop> <fvalue>" "\n"
+        "\t" "                 : <fwhere> [<bitwop> <foperand>] EQ|NE <comma separated fvalue list>" "\n"
+        "\t" "* <bitwop> : &, |, ^" "\n"
+        "\t" "* <compop> : EQ, NE, LT, LE, GT, GE" "\n"
+        );
+#endif
+#else
         out_string(c,
         "\t" "bop create <key> <attributes> [noreply]\\r\\n" "\n"
         "\t" "bop insert|upsert <key> <bkey> [<eflag>] <bytes> [create <attributes>] [noreply|pipe|getrim]\\r\\n<data>\\r\\n" "\n"
@@ -7778,6 +8757,7 @@ static void process_help_command(conn *c, token_t *tokens, const size_t ntokens)
         "\t" "* <bitwop> : &, |, ^" "\n"
         "\t" "* <compop> : EQ, NE, LT, LE, GT, GE" "\n"
         );
+#endif
     } else if (ntokens > 2 && strcmp(type, "attr") == 0) {
         out_string(c,
         "\t" "getattr <key> [<attribute name> ...]\\r\\n" "\n"
@@ -7797,12 +8777,32 @@ static void process_help_command(conn *c, token_t *tokens, const size_t ntokens)
         "\t" "stats prefixes\\r\\n" "\n"
         "\t" "stats detail [on|off|dump]\\r\\n" "\n"
         "\t" "stats scrub\\r\\n" "\n"
+#ifdef JHPARK_KEY_DUMP
+        "\t" "stats dump\\r\\n" "\n"
+#endif
         "\t" "stats cachedump <slab_clsid> <limit> [forward|backward [sticky]]\\r\\n" "\n"
         "\t" "stats reset\\r\\n" "\n"
+#ifdef DETECT_LONG_QUERY
+        "\n"
+        "\t" "lqdetect start [<detect_standard>]\\r\\n" "\n"
+        "\t" "lqdetect stop\\r\\n" "\n"
+        "\t" "lqdetect show\\r\\n" "\n"
+        "\t" "lqdetect stats\\r\\n" "\n"
+#endif
+#ifdef JHPARK_KEY_DUMP
+        "\n"
+        "\t" "dump start key [<prefix>] filepath\\r\\n" "\n"
+        "\t" "dump stop\\r\\n" "\n"
+#endif
         "\n"
         "\t" "config verbosity [<verbose>]\\r\\n" "\n"
         "\t" "config memlimit [<memsize(MB)>]\\r\\n" "\n"
         "\t" "config maxconns [<maxconn>]\\r\\n" "\n"
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+        "\t" "config max_list_size [<maxsize>]\\r\\n" "\n"
+        "\t" "config max_set_size [<maxsize>]\\r\\n" "\n"
+        "\t" "config max_btree_size [<maxsize>]\\r\\n" "\n"
+#endif
 #ifdef ENABLE_ZK_INTEGRATION
         "\t" "config hbtimeout [<hbtimeout>]\\r\\n" "\n"
         "\t" "config hbfailstop [<hbfailstop>]\\r\\n" "\n"
@@ -7832,7 +8832,7 @@ static void process_extension_command(conn *c, token_t *tokens, size_t ntokens)
     }
     /* ntokens must be larger than 0 in order to avoid segfault in the next for statement. */
     if (ntokens <= 0) {
-        out_string(c, "ERROR");
+        out_string(c, "ERROR no arguments");
         return;
     }
 
@@ -7842,9 +8842,7 @@ static void process_extension_command(conn *c, token_t *tokens, size_t ntokens)
         }
     }
     if (cmd == NULL) {
-        /* Unify the response string in case of command mismatch */
-        /* out_string(c, "ERROR unknown command"); */
-        out_string(c, "ERROR");
+        out_string(c, "ERROR no matching command");
         return;
     }
     if (nbytes == 0) {
@@ -7868,6 +8866,223 @@ static void process_extension_command(conn *c, token_t *tokens, size_t ntokens)
         conn_set_state(c, conn_nread);
     }
 }
+
+#ifdef COMMAND_LOGGING
+static void get_cmdlog_stats(char* str)
+{
+    char *stop_cause_str[3] = {"stop by explicit request",     // CMDLOG_EXPLICIT_STOP
+                               "stop by command log overflow", // CMDLOG_OVERFLOW_STOP
+                               "stop by disk flush error"};    // CMDLOG_FLUSHERR_STOP
+    struct cmd_log_stats *stats = cmdlog_stats();
+
+    snprintf(str, CMDLOG_INPUT_SIZE,
+            "\t" "Command logging stats" "\n"
+            "\t" "The last running time : %d_%d ~ %d_%d" "\n"
+            "\t" "The number of entered commands : %d" "\n"
+            "\t" "The number of skipped commands : %d" "\n"
+            "\t" "The number of log files : %d" "\n"
+            "\t" "The log file name: %s/%d_%d_%d_{n}.log" "\n"
+            "\t" "How command logging stopped : %s" "\n",
+            stats->bgndate, stats->bgntime, stats->enddate, stats->endtime,
+            stats->entered_commands, stats->skipped_commands,
+            stats->file_count,
+            stats->dirpath, settings.port, stats->bgndate, stats->bgntime,
+            (stats->stop_cause >= 0 && stats->stop_cause <= 2 ?
+             stop_cause_str[stats->stop_cause] : "unknown"));
+}
+
+static void process_logging_command(conn *c, token_t *tokens, const size_t ntokens)
+{
+    char *type = tokens[COMMAND_TOKEN+1].value;
+    char *fpath = NULL;
+    bool already_check = false;
+    int ret;
+
+    if (ntokens > 2 && strcmp(type, "start") == 0) {
+        if (ntokens > 3) {
+            fpath = tokens[COMMAND_TOKEN+2].value;
+        }
+
+        ret = cmdlog_start(fpath, &already_check);
+        if (already_check) {
+            out_string(c, "\tcommand logging already started.\n");
+        } else if (! already_check && ret == 0) {
+            out_string(c, "\tcommand logging started.\n");
+            cmdlog_in_use = true;
+        } else {
+            out_string(c, "\tcommand logging failed to start.\n");
+            cmdlog_in_use = false;
+        }
+    } else if (ntokens > 2 && strcmp(type, "stop") == 0) {
+        cmdlog_stop(&already_check);
+        if (already_check) {
+            out_string(c, "\tcommand logging already stopped.\n");
+        } else {
+            out_string(c, "\tcommand logging stopped.\n");
+            cmdlog_in_use = false;
+        }
+    } else if (ntokens > 2 && strcmp(type, "stats") == 0) {
+        char *str = malloc(CMDLOG_INPUT_SIZE * sizeof(char));
+        if (str) {
+            get_cmdlog_stats(str);
+            write_and_free(c, str, strlen(str));
+        } else {
+            out_string(c, "\tcommand logging failed to get stats memory.\n");
+        }
+    } else {
+        out_string(c, "\t* Usage: cmdlog [start [path] | stop | stats]\n");
+    }
+}
+#endif
+
+#ifdef DETECT_LONG_QUERY
+static void lqdetect_make_bkeystring(const unsigned char* from_bkey, const unsigned char* to_bkey,
+                                     const int from_nbkey, const int to_nbkey,
+                                     const eflag_filter *efilter, char *bufptr) {
+    char *tmpptr = bufptr;
+
+    /* bkey */
+    if (from_nbkey > 0) {
+        memcpy(tmpptr, "0x", 2); tmpptr += 2;
+        safe_hexatostr(from_bkey, from_nbkey, tmpptr);
+        tmpptr += strlen(tmpptr);
+        if (to_bkey != NULL) {
+            memcpy(tmpptr, "..0x", 4); tmpptr += 4;
+            safe_hexatostr(to_bkey, to_nbkey, tmpptr);
+            tmpptr += strlen(tmpptr);
+        }
+    } else {
+        sprintf(tmpptr, "%"PRIu64"", *(uint64_t*)from_bkey);
+        tmpptr += strlen(tmpptr);
+        if (to_bkey != NULL) {
+            sprintf(tmpptr, "..%"PRIu64"", *(uint64_t*)to_bkey);
+            tmpptr += strlen(tmpptr);
+        }
+    }
+    /* efilter */
+    if (efilter != NULL) {
+        strcpy(tmpptr, " efilter");
+    }
+}
+
+static void lqdetect_get_stats(char* str)
+{
+    char *stop_cause_str[3] = {"stop by explicit request",     // LONGQ_EXPLICIT_STOP
+                               "stop by long query overflow", // LONGQ_OVERFLOW_STOP
+                               "is running"}; // LONGQ_RUNNING
+    struct lq_detect_stats stats;
+    lqdetect_stats(&stats);
+
+    snprintf(str, LONGQ_STAT_STRLEN,
+            "\t" "Long query detection stats" "\n"
+            "\t" "The last running time : %d_%d ~ %d_%d" "\n"
+            "\t" "The number of total long query commands : %d" "\n"
+            "\t" "The detection standard : %d" "\n"
+            "\t" "How long query detection stopped : %s" "\n",
+            stats.bgndate, stats.bgntime, stats.enddate, stats.endtime,
+            stats.total_lqcmds, stats.standard,
+            (stats.stop_cause >= 0 && stats.stop_cause <= 2 ?
+             stop_cause_str[stats.stop_cause] : "unknown"));
+}
+
+static void lqdetect_show(conn *c)
+{
+    char *shorted_str[LONGQ_COMMAND_NUM] = {
+                            "sop get command entered count :",
+                            "lop insert command entered count :",
+                            "lop delete command entered count :",
+                            "lop get command entered count :",
+                            "bop delete command entered count :",
+                            "bop get command entered count :",
+                            "bop count command entered count :",
+                            "bop gbp command entered count :"};
+    char *data;
+    uint32_t length;
+    uint32_t cmdcnt;
+    int ii, ret = 0;
+
+    /* create detected long query return string */
+    for(ii = 0; ii < LONGQ_COMMAND_NUM; ii++) {
+        data = lqdetect_buffer_get(ii, &length, &cmdcnt);
+        c->lq_bufcnt++;
+
+        char *count = get_suffix_buffer(c);
+        if (count == NULL) {
+            out_string(c, "SERVER ERROR out of memory wrting show response");
+            lqdetect_buffer_release(c->lq_bufcnt);
+            c->lq_bufcnt = 0;
+            ret = -1; break;
+        }
+        int count_len = snprintf(count, SUFFIX_SIZE, " %d\n", cmdcnt);
+
+        if (add_iov(c, shorted_str[ii], strlen(shorted_str[ii])) != 0 ||
+            add_iov(c, count, count_len) != 0 ||
+            add_iov(c, data, length) != 0 ||
+            add_iov(c, "\n", 1) != 0)
+            {
+                out_string(c, "SERVER ERROR out of memory wrting show response");
+                lqdetect_buffer_release(c->lq_bufcnt);
+                c->lq_bufcnt = 0;
+                ret = -1; break;
+            }
+    }
+    c->suffixcurr = c->suffixlist;
+
+    if (ret == 0) {
+        conn_set_state(c, conn_mwrite);
+        c->msgcurr = 0;
+    }
+}
+
+static void process_lqdetect_command(conn *c, token_t *tokens, size_t ntokens)
+{
+    char *type = tokens[COMMAND_TOKEN+1].value;
+    bool already_check = false;
+    uint32_t standard;
+    int ret;
+
+    if (ntokens > 2 && strcmp(type, "start") == 0) {
+        if (ntokens == 3) {
+            standard = LONGQ_STANDARD_DEFAULT;
+        } else {
+            if (! safe_strtoul(tokens[COMMAND_TOKEN+2].value, &standard)) {
+                out_string(c, "CLIENT_ERROR bad command line format");
+                return;
+            }
+        }
+
+        ret = lqdetect_start(standard, &already_check);
+        if (ret == 0) {
+            if (already_check) {
+                out_string(c, "\tlong query detection already started.\n");
+            } else {
+                out_string(c, "\tlong query detection started.\n");
+                lqdetect_in_use = true;
+            }
+        } else {
+            out_string(c, "\tlong query detection failed to start.\n");
+        }
+    } else if (ntokens > 2 && strcmp(type, "stop") == 0) {
+        lqdetect_stop(&already_check);
+        if (already_check) {
+            out_string(c, "\tlong query detection already stopped.\n");
+        } else {
+            out_string(c, "\tlong query detection stopped.\n");
+            lqdetect_in_use = false;
+        }
+    } else if (ntokens > 2 && strcmp(type, "show") == 0) {
+        lqdetect_show(c);
+    } else if (ntokens > 2 && strcmp(type, "stats") == 0) {
+        char str[LONGQ_STAT_STRLEN];
+        lqdetect_get_stats(str);
+        out_string(c, str);
+    } else {
+        out_string(c,
+        "\t" "* Usage: lqdetect [start [standard] | stop | show | stats]" "\n"
+        );
+    }
+}
+#endif
 
 static inline int get_coll_create_attr_from_tokens(token_t *tokens, const int ntokens,
                                                    int coll_type, item_attr *attrp)
@@ -7985,6 +9200,30 @@ static void process_lop_get(conn *c, char *key, size_t nkey,
         stats_prefix_record_lop_get(key, nkey, (ret==ENGINE_SUCCESS || ret==ENGINE_ELEM_ENOENT));
     }
 
+#ifdef DETECT_LONG_QUERY
+    /* long query detection */
+    if (lqdetect_in_use && ret == ENGINE_SUCCESS) {
+        uint32_t overhead = elem_count + (from_index >= 0 ? from_index+1 : -(from_index));
+        if (lqdetect_discriminant(overhead)) {
+            struct lq_detect_argument argument;
+            char *bufptr = argument.range;
+
+            snprintf(bufptr, 36, "%d..%d", from_index, to_index);
+            argument.overhead = overhead;
+            argument.delete_or_drop = 0;
+            if (drop_if_empty) {
+                argument.delete_or_drop = 2;
+            } else if (delete) {
+                argument.delete_or_drop = 1;
+            }
+
+            if (! lqdetect_save_cmd(c->client_ip, key, LQCMD_LOP_GET, &argument)) {
+                lqdetect_in_use = false;
+            }
+        }
+    }
+#endif
+
     switch (ret) {
     case ENGINE_SUCCESS:
         {
@@ -8075,7 +9314,7 @@ static void process_lop_prepare_nread(conn *c, int cmd, size_t vlen,
     if (vlen > MAX_ELEMENT_BYTES) {
         ret = ENGINE_E2BIG;
     } else {
-        ret = mc_engine.v1->list_elem_alloc(mc_engine.v0, c, &elem, vlen);
+        ret = mc_engine.v1->list_elem_alloc(mc_engine.v0, c, key, nkey, vlen, &elem);
     }
 
     if (settings.detail_enabled && ret != ENGINE_SUCCESS) {
@@ -8105,7 +9344,7 @@ static void process_lop_prepare_nread(conn *c, int cmd, size_t vlen,
         STATS_NOKEY(c, cmd_lop_insert);
         if (ret == ENGINE_E2BIG) out_string(c, "CLIENT_ERROR too large value");
         else if (ret == ENGINE_ENOMEM) out_string(c, "SERVER_ERROR out of memory");
-        else out_string(c, "SERVER_ERROR internal");
+        else handle_unexpected_errorcode_ascii(c, ret);
 
         /* swallow the data line */
         c->write_and_go = conn_swallow;
@@ -8165,6 +9404,28 @@ static void process_lop_delete(conn *c, char *key, size_t nkey,
     if (settings.detail_enabled) {
         stats_prefix_record_lop_delete(key, nkey, (ret==ENGINE_SUCCESS || ret==ENGINE_ELEM_ENOENT));
     }
+
+#ifdef DETECT_LONG_QUERY
+    /* long query detection */
+    if (lqdetect_in_use && ret == ENGINE_SUCCESS) {
+        uint32_t overhead = del_count + (from_index >= 0 ? from_index+1 : -(from_index));
+        if (lqdetect_discriminant(overhead)) {
+            struct lq_detect_argument argument;
+            char *bufptr = argument.range;
+
+            snprintf(bufptr, 36, "%d..%d", from_index, to_index);
+            argument.overhead = overhead;
+            argument.delete_or_drop = 0;
+            if (drop_if_empty) {
+                argument.delete_or_drop = 2;
+            }
+
+            if (! lqdetect_save_cmd(c->client_ip, key, LQCMD_LOP_DELETE, &argument)) {
+                lqdetect_in_use = false;
+            }
+        }
+    }
+#endif
 
     switch (ret) {
     case ENGINE_SUCCESS:
@@ -8258,7 +9519,9 @@ static void process_lop_command(conn *c, token_t *tokens, const size_t ntokens)
             c->coll_attrp = NULL;
         }
 
-        process_lop_prepare_nread(c, (int)OPERATION_LOP_INSERT, vlen, key, nkey, index);
+        if (check_and_handle_pipe_state(c, vlen)) {
+            process_lop_prepare_nread(c, (int)OPERATION_LOP_INSERT, vlen, key, nkey, index);
+        }
     }
     else if ((ntokens >= 7 && ntokens <= 10) && (strcmp(subcommand, "create") == 0))
     {
@@ -8302,7 +9565,9 @@ static void process_lop_command(conn *c, token_t *tokens, const size_t ntokens)
             }
         }
 
-        process_lop_delete(c, key, nkey, from_index, to_index, drop_if_empty);
+        if (check_and_handle_pipe_state(c, 0)) {
+            process_lop_delete(c, key, nkey, from_index, to_index, drop_if_empty);
+        }
     }
     else if ((ntokens==5 || ntokens==6) && (strcmp(subcommand, "get") == 0))
     {
@@ -8367,6 +9632,30 @@ static void process_sop_get(conn *c, char *key, size_t nkey, uint32_t count,
     if (settings.detail_enabled) {
         stats_prefix_record_sop_get(key, nkey, (ret==ENGINE_SUCCESS || ret==ENGINE_ELEM_ENOENT));
     }
+
+#ifdef DETECT_LONG_QUERY
+    /* long query detection */
+    if (lqdetect_in_use && ret == ENGINE_SUCCESS) {
+        if (lqdetect_discriminant(elem_count)) {
+            struct lq_detect_argument argument;
+            char *bufptr = argument.range;
+
+            snprintf(bufptr, 16, "%d", count);
+            argument.overhead = elem_count;
+            argument.count = count;
+            argument.delete_or_drop = 0;
+            if (drop_if_empty) {
+                argument.delete_or_drop = 2;
+            } else if (delete) {
+                argument.delete_or_drop = 1;
+            }
+
+            if (! lqdetect_save_cmd(c->client_ip, key, LQCMD_SOP_GET, &argument)) {
+                lqdetect_in_use = false;
+            }
+        }
+    }
+#endif
 
     switch (ret) {
     case ENGINE_SUCCESS:
@@ -8458,7 +9747,7 @@ static void process_sop_prepare_nread(conn *c, int cmd, size_t vlen, char *key, 
         ret = ENGINE_E2BIG;
     } else {
         if (cmd == (int)OPERATION_SOP_INSERT) {
-            ret = mc_engine.v1->set_elem_alloc(mc_engine.v0, c, &elem, vlen);
+            ret = mc_engine.v1->set_elem_alloc(mc_engine.v0, c, key, nkey, vlen, &elem);
         } else { /* OPERATION_SOP_DELETE or OPERATION_SOP_EXIST */
             if ((elem = (eitem *)malloc(sizeof(elem_value) + vlen)) == NULL)
                 ret = ENGINE_ENOMEM;
@@ -8508,7 +9797,7 @@ static void process_sop_prepare_nread(conn *c, int cmd, size_t vlen, char *key, 
 
         if (ret == ENGINE_E2BIG) out_string(c, "CLIENT_ERROR too large value");
         else if (ret == ENGINE_ENOMEM) out_string(c, "SERVER_ERROR out of memory");
-        else out_string(c, "SERVER_ERROR internal");
+        else handle_unexpected_errorcode_ascii(c, ret);
 
         /* swallow the data line */
         c->write_and_go = conn_swallow;
@@ -8594,7 +9883,9 @@ static void process_sop_command(conn *c, token_t *tokens, const size_t ntokens)
             c->coll_attrp = NULL;
         }
 
-        process_sop_prepare_nread(c, (int)OPERATION_SOP_INSERT, vlen, key, nkey);
+        if (check_and_handle_pipe_state(c, vlen)) {
+            process_sop_prepare_nread(c, (int)OPERATION_SOP_INSERT, vlen, key, nkey);
+        }
     }
     else if ((ntokens >= 7 && ntokens <= 10) && (strcmp(subcommand, "create") == 0))
     {
@@ -8640,7 +9931,9 @@ static void process_sop_command(conn *c, token_t *tokens, const size_t ntokens)
             }
         }
 
-        process_sop_prepare_nread(c, (int)OPERATION_SOP_DELETE, vlen, key, nkey);
+        if (check_and_handle_pipe_state(c, vlen)) {
+            process_sop_prepare_nread(c, (int)OPERATION_SOP_DELETE, vlen, key, nkey);
+        }
     }
     else if ((ntokens==5 || ntokens==6) && strcmp(subcommand, "exist") == 0)
     {
@@ -8654,7 +9947,9 @@ static void process_sop_command(conn *c, token_t *tokens, const size_t ntokens)
         }
         vlen += 2;
 
-        process_sop_prepare_nread(c, (int)OPERATION_SOP_EXIST, vlen, key, nkey);
+        if (check_and_handle_pipe_state(c, vlen)) {
+            process_sop_prepare_nread(c, (int)OPERATION_SOP_EXIST, vlen, key, nkey);
+        }
     }
     else if ((ntokens==5 || ntokens==6) && (strcmp(subcommand, "get") == 0))
     {
@@ -8694,6 +9989,7 @@ static void process_bop_get(conn *c, char *key, size_t nkey,
 {
     eitem  **elem_array = NULL;
     uint32_t elem_count;
+    uint32_t access_count;
     uint32_t flags, i;
     bool     dropped_trimmed;
     int      est_count;
@@ -8716,7 +10012,7 @@ static void process_bop_get(conn *c, char *key, size_t nkey,
     ret = mc_engine.v1->btree_elem_get(mc_engine.v0, c, key, nkey,
                                        bkrange, efilter, offset, count,
                                        delete, drop_if_empty,
-                                       elem_array, &elem_count,
+                                       elem_array, &elem_count, &access_count,
                                        &flags, &dropped_trimmed, 0);
     if (ret == ENGINE_EWOULDBLOCK) {
         c->ewouldblock = true;
@@ -8726,6 +10022,33 @@ static void process_bop_get(conn *c, char *key, size_t nkey,
     if (settings.detail_enabled) {
         stats_prefix_record_bop_get(key, nkey, (ret==ENGINE_SUCCESS || ret==ENGINE_ELEM_ENOENT));
     }
+
+#ifdef DETECT_LONG_QUERY
+    /* long query detection */
+    if (lqdetect_in_use && ret == ENGINE_SUCCESS) {
+        if (lqdetect_discriminant(access_count)) {
+            struct lq_detect_argument argument;
+            char *bufptr = argument.range;
+
+            lqdetect_make_bkeystring(bkrange->from_bkey, bkrange->to_bkey,
+                                     bkrange->from_nbkey, bkrange->to_nbkey,
+                                     efilter, bufptr);
+            argument.overhead = access_count;
+            argument.offset = offset;
+            argument.count = count;
+            argument.delete_or_drop = 0;
+            if (drop_if_empty) {
+                argument.delete_or_drop = 2;
+            } else if (delete) {
+                argument.delete_or_drop = 1;
+            }
+
+            if (! lqdetect_save_cmd(c->client_ip, key, LQCMD_BOP_GET, &argument)) {
+                lqdetect_in_use = false;
+            }
+        }
+    }
+#endif
 
     switch (ret) {
     case ENGINE_SUCCESS:
@@ -8820,16 +10143,35 @@ static void process_bop_count(conn *c, char *key, size_t nkey,
                               const bkey_range *bkrange, const eflag_filter *efilter)
 {
     uint32_t elem_count;
-    uint32_t flags;
+    uint32_t access_count;
 
     ENGINE_ERROR_CODE ret;
     ret = mc_engine.v1->btree_elem_count(mc_engine.v0, c,
                                          key, nkey, bkrange, efilter,
-                                         &elem_count, &flags, 0);
+                                         &elem_count, &access_count, 0);
 
     if (settings.detail_enabled) {
         stats_prefix_record_bop_count(key, nkey, (ret==ENGINE_SUCCESS));
     }
+
+#ifdef DETECT_LONG_QUERY
+    /* long query detection */
+    if (lqdetect_in_use && ret == ENGINE_SUCCESS) {
+        if (lqdetect_discriminant(access_count)) {
+            struct lq_detect_argument argument;
+            char *bufptr = argument.range;
+
+            lqdetect_make_bkeystring(bkrange->from_bkey, bkrange->to_bkey,
+                                     bkrange->from_nbkey, bkrange->to_nbkey,
+                                     efilter, bufptr);
+            argument.overhead = access_count;
+
+            if (! lqdetect_save_cmd(c->client_ip, key, LQCMD_BOP_COUNT, &argument)) {
+                lqdetect_in_use = false;
+            }
+        }
+    }
+#endif
 
     switch (ret) {
     case ENGINE_SUCCESS:
@@ -9040,6 +10382,24 @@ static void process_bop_gbp(conn *c, char *key, size_t nkey, ENGINE_BTREE_ORDER 
         stats_prefix_record_bop_gbp(key, nkey, (ret==ENGINE_SUCCESS || ret==ENGINE_ELEM_ENOENT));
     }
 
+#ifdef DETECT_LONG_QUERY
+    /* long query detection */
+    if (lqdetect_in_use && ret == ENGINE_SUCCESS) {
+        if (lqdetect_discriminant(elem_count)) {
+            struct lq_detect_argument argument;
+            char *bufptr = argument.range;
+
+            snprintf(bufptr, 36, "%d..%d", from_posi, to_posi);
+            argument.overhead = elem_count;
+            argument.asc_or_desc = order == BTREE_ORDER_ASC ? 1 : 2;
+
+            if (! lqdetect_save_cmd(c->client_ip, key, LQCMD_BOP_GBP, &argument)) {
+                lqdetect_in_use = false;
+            }
+        }
+    }
+#endif
+
     switch (ret) {
     case ENGINE_SUCCESS:
         {
@@ -9175,8 +10535,8 @@ static void process_bop_prepare_nread(conn *c, int cmd, char *key, size_t nkey,
     if (vlen > MAX_ELEMENT_BYTES) {
         ret = ENGINE_E2BIG;
     } else {
-        ret = mc_engine.v1->btree_elem_alloc(mc_engine.v0, c, &elem,
-                                             nbkey, neflag, vlen);
+        ret = mc_engine.v1->btree_elem_alloc(mc_engine.v0, c, key, nkey,
+                                             nbkey, neflag, vlen, &elem);
     }
 
     if (settings.detail_enabled && ret != ENGINE_SUCCESS) {
@@ -9208,7 +10568,7 @@ static void process_bop_prepare_nread(conn *c, int cmd, char *key, size_t nkey,
         STATS_NOKEY(c, cmd_bop_insert);
         if (ret == ENGINE_E2BIG) out_string(c, "CLIENT_ERROR too large value");
         else if (ret == ENGINE_ENOMEM) out_string(c, "SERVER_ERROR out of memory");
-        else out_string(c, "SERVER_ERROR internal");
+        else handle_unexpected_errorcode_ascii(c, ret);
 
         /* swallow the data line */
         c->write_and_go = conn_swallow;
@@ -9217,7 +10577,8 @@ static void process_bop_prepare_nread(conn *c, int cmd, char *key, size_t nkey,
 }
 
 #if defined(SUPPORT_BOP_MGET) || defined(SUPPORT_BOP_SMGET)
-static void process_bop_prepare_nread_keys(conn *c, int cmd, size_t vlen) {
+static void process_bop_prepare_nread_keys(conn *c, int cmd, uint32_t vlen, uint32_t kcnt)
+{
     eitem *elem = NULL;
     ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
     int need_size = 0;
@@ -9234,20 +10595,54 @@ static void process_bop_prepare_nread_keys(conn *c, int cmd, size_t vlen) {
 #endif
 #ifdef SUPPORT_BOP_SMGET
     if (cmd == OPERATION_BOP_SMGET) {
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+      if (c->coll_smgmode == 0) {
         int smget_count = c->coll_roffset + c->coll_rcount;
         int elem_array_size; /* elem pointer array where the found elements will be saved */
-        int keys_array_size; /* keyinfo(token_t) array where the address and length of keys are to be saved */
         int kmis_array_size; /* key index array where the missed key indexes are to be saved */
         int respon_hdr_size; /* the size of response head and tail */
         int respon_bdy_size; /* the size of response body */
 
         elem_array_size = smget_count * (sizeof(eitem*) + (2*sizeof(uint32_t)));
-        keys_array_size = c->coll_numkeys * sizeof(token_t);
         kmis_array_size = c->coll_numkeys * sizeof(uint32_t);
         respon_hdr_size = (2*lenstr_size) + 30; /* result head and tail size */
         respon_bdy_size = smget_count * ((MAX_BKEY_LENG*2+2)+(MAX_EFLAG_LENG*2+2)+(lenstr_size*2)+5); /* result body size */
 
-        need_size = elem_array_size + keys_array_size + kmis_array_size + respon_hdr_size + respon_bdy_size;
+        need_size = elem_array_size + kmis_array_size + respon_hdr_size + respon_bdy_size;
+      } else {
+#endif
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        int elem_array_size; /* smget element array size */
+        int ehit_array_size; /* smget hitted elem array size */
+        int emis_array_size; /* element missed keys array size */
+#else
+        int smget_count = c->coll_roffset + c->coll_rcount;
+        int elem_array_size; /* elem pointer array where the found elements will be saved */
+        int kmis_array_size; /* key index array where the missed key indexes are to be saved */
+#endif
+        int respon_hdr_size; /* the size of response head and tail */
+        int respon_bdy_size; /* the size of response body */
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        elem_array_size = (c->coll_rcount + c->coll_numkeys) * sizeof(eitem*);
+        ehit_array_size = c->coll_rcount * sizeof(smget_ehit_t);
+        emis_array_size = c->coll_numkeys * sizeof(smget_emis_t);
+        respon_hdr_size = (3*lenstr_size) + 50; /* result head and tail size */
+        respon_bdy_size = (c->coll_rcount * ((MAX_BKEY_LENG*2+2)+(MAX_EFLAG_LENG*2+2)+(lenstr_size*2)+10))
+                        + (c->coll_numkeys * ((MAX_EFLAG_LENG*2+2) + 5)); /* result body size */
+        need_size = elem_array_size + ehit_array_size + emis_array_size
+                  + respon_hdr_size + respon_bdy_size;
+#else
+        elem_array_size = smget_count * (sizeof(eitem*) + (2*sizeof(uint32_t)));
+        kmis_array_size = c->coll_numkeys * sizeof(uint32_t);
+        respon_hdr_size = (2*lenstr_size) + 30; /* result head and tail size */
+        respon_bdy_size = smget_count * ((MAX_BKEY_LENG*2+2)+(MAX_EFLAG_LENG*2+2)+(lenstr_size*2)+5); /* result body size */
+
+        need_size = elem_array_size + kmis_array_size + respon_hdr_size + respon_bdy_size;
+#endif
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+     }
+#endif
     }
 #endif
     assert(need_size > 0);
@@ -9255,7 +10650,9 @@ static void process_bop_prepare_nread_keys(conn *c, int cmd, size_t vlen) {
     if ((elem = (eitem *)malloc(need_size)) == NULL) {
         ret = ENGINE_ENOMEM;
     } else {
-        if ((c->coll_mkeys = malloc(vlen)) == NULL) {
+        int kmem_size = GET_8ALIGN_SIZE(vlen)
+                      + (sizeof(token_t) * c->coll_numkeys);
+        if ((c->coll_mkeys = malloc(kmem_size)) == NULL) {
             free((void*)elem);
             ret = ENGINE_ENOMEM;
         }
@@ -9330,6 +10727,7 @@ static void process_bop_delete(conn *c, char *key, size_t nkey,
                                uint32_t count, bool drop_if_empty)
 {
     uint32_t del_count;
+    uint32_t acc_count; /* access count */
     bool     dropped;
 
     assert(c->ewouldblock == false);
@@ -9337,7 +10735,7 @@ static void process_bop_delete(conn *c, char *key, size_t nkey,
     ENGINE_ERROR_CODE ret;
     ret = mc_engine.v1->btree_elem_delete(mc_engine.v0, c, key, nkey,
                                           bkrange, efilter, count, drop_if_empty,
-                                          &del_count, &dropped, 0);
+                                          &del_count, &acc_count, &dropped, 0);
     if (ret == ENGINE_EWOULDBLOCK) {
         c->ewouldblock = true;
         ret = ENGINE_SUCCESS;
@@ -9346,6 +10744,30 @@ static void process_bop_delete(conn *c, char *key, size_t nkey,
     if (settings.detail_enabled) {
         stats_prefix_record_bop_delete(key, nkey, (ret==ENGINE_SUCCESS || ret==ENGINE_ELEM_ENOENT));
     }
+
+#ifdef DETECT_LONG_QUERY
+    /* long query detection */
+    if (lqdetect_in_use && ret == ENGINE_SUCCESS) {
+        if (lqdetect_discriminant(acc_count)) {
+            struct lq_detect_argument argument;
+            char *bufptr = argument.range;
+
+            lqdetect_make_bkeystring(bkrange->from_bkey, bkrange->to_bkey,
+                                     bkrange->from_nbkey, bkrange->to_nbkey,
+                                     efilter, bufptr);
+            argument.overhead = acc_count;
+            argument.count = count;
+            argument.delete_or_drop = 0;
+            if (drop_if_empty) {
+                argument.delete_or_drop = 2;
+            }
+
+            if (! lqdetect_save_cmd(c->client_ip, key, LQCMD_BOP_DELETE, &argument)) {
+                lqdetect_in_use = false;
+            }
+        }
+    }
+#endif
 
     switch (ret) {
     case ENGINE_SUCCESS:
@@ -9707,7 +11129,9 @@ static void process_bop_command(conn *c, token_t *tokens, const size_t ntokens)
             c->coll_attrp = NULL;
         }
 
-        process_bop_prepare_nread(c, subcommid, key, nkey, bkey, nbkey, eflag, neflag, vlen);
+        if (check_and_handle_pipe_state(c, vlen)) {
+            process_bop_prepare_nread(c, subcommid, key, nkey, bkey, nbkey, eflag, neflag, vlen);
+        }
     }
     else if ((ntokens >= 7 && ntokens <= 10) && (strcmp(subcommand, "create") == 0))
     {
@@ -9797,19 +11221,23 @@ static void process_bop_command(conn *c, token_t *tokens, const size_t ntokens)
             return;
         }
         if (vlen == -1) {
-            if (c->coll_eupdate.neflag == EFLAG_NULL) {
-                /* Nothing to update */
-                //out_string(c, "CLIENT_ERROR nothing to update");
-                out_string(c, "NOTHING_TO_UPDATE");
-                return;
+            if (check_and_handle_pipe_state(c, 0)) {
+                if (c->coll_eupdate.neflag == EFLAG_NULL) {
+                    /* Nothing to update */
+                    //out_string(c, "CLIENT_ERROR nothing to update");
+                    out_string(c, "NOTHING_TO_UPDATE");
+                    return;
+                }
+                c->coll_key  = key;
+                c->coll_nkey = nkey;
+                c->coll_op   = OPERATION_BOP_UPDATE;
+                process_bop_update_complete(c);
             }
-            c->coll_key  = key;
-            c->coll_nkey = nkey;
-            c->coll_op   = OPERATION_BOP_UPDATE;
-            process_bop_update_complete(c);
         } else { /* vlen >= 0 */
             vlen += 2;
-            process_bop_update_prepare_nread(c, (int)OPERATION_BOP_UPDATE, key, nkey, vlen);
+            if (check_and_handle_pipe_state(c, vlen)) {
+                process_bop_update_prepare_nread(c, (int)OPERATION_BOP_UPDATE, key, nkey, vlen);
+            }
         }
     }
     else if ((ntokens >= 5 && ntokens <= 13) && (strcmp(subcommand, "delete") == 0))
@@ -9860,9 +11288,11 @@ static void process_bop_command(conn *c, token_t *tokens, const size_t ntokens)
             }
         }
 
-        process_bop_delete(c, key, nkey, &c->coll_bkrange,
-                           (c->coll_efilter.ncompval==0 ? NULL : &c->coll_efilter),
-                           count, drop_if_empty);
+        if (check_and_handle_pipe_state(c, 0)) {
+            process_bop_delete(c, key, nkey, &c->coll_bkrange,
+                               (c->coll_efilter.ncompval==0 ? NULL : &c->coll_efilter),
+                               count, drop_if_empty);
+        }
     }
     else if ((ntokens >= 6 && ntokens <= 9) && (strcmp(subcommand, "incr") == 0 || strcmp(subcommand, "decr") == 0))
     {
@@ -9910,7 +11340,10 @@ static void process_bop_command(conn *c, token_t *tokens, const size_t ntokens)
             create = true;
         }
 
-        process_bop_arithmetic(c, key, nkey, &c->coll_bkrange, incr, create, delta, initial, eflagptr);
+        if (check_and_handle_pipe_state(c, 0)) {
+            process_bop_arithmetic(c, key, nkey, &c->coll_bkrange, incr,
+                                   create, delta, initial, eflagptr);
+        }
     }
     else if ((ntokens >= 5 && ntokens <= 13) && (strcmp(subcommand, "get") == 0))
     {
@@ -10013,6 +11446,13 @@ static void process_bop_command(conn *c, token_t *tokens, const size_t ntokens)
     {
         uint32_t count, offset = 0;
         uint32_t lenkeys, numkeys;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+        int smgmode = set_smget_mode_maybe(c, tokens, ntokens);
+#else
+        bool unique = set_unique_maybe(c, tokens, ntokens);
+#endif
+#endif
 
         if ((! safe_strtoul(tokens[BOP_KEY_TOKEN].value, &lenkeys)) ||
             (! safe_strtoul(tokens[BOP_KEY_TOKEN+1].value, &numkeys))) {
@@ -10026,7 +11466,15 @@ static void process_bop_command(conn *c, token_t *tokens, const size_t ntokens)
         }
 
         int read_ntokens = 5;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+        int post_ntokens = (smgmode > 0 ? 3 : 2); /* "\r\n" */
+#else
+        int post_ntokens = (unique ? 3 : 2); /* "\r\n" */
+#endif
+#else
         int post_ntokens = 2; /* "\r\n" */
+#endif
         int rest_ntokens = ntokens - read_ntokens - post_ntokens;
 
         if (rest_ntokens >= 3) {
@@ -10088,8 +11536,15 @@ static void process_bop_command(conn *c, token_t *tokens, const size_t ntokens)
         c->coll_lenkeys = lenkeys;
         c->coll_roffset = offset;
         c->coll_rcount  = count;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+        c->coll_smgmode = smgmode;
+#else
+        c->coll_unique  = unique;
+#endif
+#endif
 
-        process_bop_prepare_nread_keys(c, subcommid, lenkeys);
+        process_bop_prepare_nread_keys(c, subcommid, lenkeys, numkeys);
     }
 #endif
     else if ((ntokens == 6) && (strcmp(subcommand, "position") == 0))
@@ -10543,6 +11998,14 @@ static void process_command(conn *c, char *command)
         return;
     }
 
+#ifdef COMMAND_LOGGING
+    if (cmdlog_in_use) {
+        if (cmdlog_write(c->client_ip, command) == false) {
+            cmdlog_in_use = false;
+        }
+    }
+#endif
+
     ntokens = tokenize_command(command, tokens, MAX_TOKENS);
 
     if ((ntokens >= 3) && ((strcmp(tokens[COMMAND_TOKEN].value, "get" ) == 0) ||
@@ -10632,20 +12095,41 @@ static void process_command(conn *c, char *command)
     {
         out_string(c, "VERSION " VERSION);
     }
+#ifdef JHPARK_KEY_DUMP
+    else if ((ntokens >= 3) && (strcmp(tokens[COMMAND_TOKEN].value, "dump") == 0))
+    {
+        process_dump_command(c, tokens, ntokens);
+    }
+#endif
     else if ((ntokens == 2) && (strcmp(tokens[COMMAND_TOKEN].value, "quit") == 0))
     {
+        STATS_LOCK();
+        mc_stats.quit_conns++;
+        STATS_UNLOCK();
         conn_set_state(c, conn_closing);
     }
     else if ((ntokens >= 2) && (strcmp(tokens[COMMAND_TOKEN].value, "help") == 0))
     {
         process_help_command(c, tokens, ntokens);
     }
+#ifdef COMMAND_LOGGING
+    else if ((ntokens >= 2) && (strcmp(tokens[COMMAND_TOKEN].value, "cmdlog") == 0))
+    {
+        process_logging_command(c, tokens, ntokens);
+    }
+#endif
+#ifdef DETECT_LONG_QUERY
+    else if ((ntokens >= 2) && (strcmp(tokens[COMMAND_TOKEN].value, "lqdetect") == 0))
+    {
+        process_lqdetect_command(c, tokens, ntokens);
+    }
+#endif
     else /* no matching command */
     {
         if (settings.extensions.ascii != NULL) {
             process_extension_command(c, tokens, ntokens);
         } else {
-            out_string(c, "ERROR");
+            out_string(c, "ERROR unknown command");
         }
     }
     return;
@@ -10767,9 +12251,19 @@ static int try_read_command(conn *c) {
                     ++ptr;
                 }
 
-                if (ptr - c->rcurr > 100 ||
-                    (strncmp(ptr, "get ", 4) && strncmp(ptr, "gets ", 5))) {
-
+                if (ptr - c->rcurr > 100) {
+                    mc_logger->log(EXTENSION_LOG_WARNING, c,
+                        "%d: Too many leading whitespaces(%d). Close the connection.\n",
+                        c->sfd, (int)(ptr - c->rcurr));
+                    conn_set_state(c, conn_closing);
+                    return 1;
+                }
+                if (strncmp(ptr, "get ", 4) && strncmp(ptr, "gets ", 5)) {
+                    char buffer[16];
+                    memcpy(buffer, ptr, 15); buffer[15] = '\0';
+                    mc_logger->log(EXTENSION_LOG_WARNING, c,
+                        "%d: Too long ascii command(%s). Close the connection.\n",
+                        c->sfd, buffer);
                     conn_set_state(c, conn_closing);
                     return 1;
                 }
@@ -10864,8 +12358,8 @@ static enum try_read_result try_read_network(conn *c) {
             char *new_rbuf = realloc(c->rbuf, c->rsize * 2);
             if (!new_rbuf) {
                 if (settings.verbose > 0) {
-                 mc_logger->log(EXTENSION_LOG_INFO, c,
-                         "Couldn't realloc input buffer\n");
+                    mc_logger->log(EXTENSION_LOG_WARNING, c,
+                            "Couldn't realloc input buffer\n");
                 }
                 c->rbytes = 0; /* ignore what we read */
                 out_string(c, "SERVER_ERROR out of memory reading request");
@@ -10889,11 +12383,22 @@ static enum try_read_result try_read_network(conn *c) {
             }
         }
         if (res == 0) {
+            /* The client called shutdown() to close the socket. */
+            if (settings.verbose > 1) {
+                mc_logger->log(EXTENSION_LOG_DEBUG, c,
+                        "Couldn't read in try_read_network: end of stream\n");
+            }
             return READ_ERROR;
         }
         if (res == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
+            }
+            /* The client called close() to close the socket. */
+            if (settings.verbose > 1) {
+                mc_logger->log(EXTENSION_LOG_DEBUG, c,
+                        "Couldn't read in try_read_network: err=(%d:%s)\n",
+                        errno, strerror(errno));
             }
             return READ_ERROR;
         }
@@ -10965,8 +12470,8 @@ static enum transmit_result transmit(conn *c) {
         if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             if (!update_event(c, EV_WRITE | EV_PERSIST)) {
                 if (settings.verbose > 0) {
-                    mc_logger->log(EXTENSION_LOG_DEBUG, c,
-                                   "Couldn't update event\n");
+                    mc_logger->log(EXTENSION_LOG_WARNING, c,
+                                   "Couldn't update event in transmit.\n");
                 }
                 conn_set_state(c, conn_closing);
                 return TRANSMIT_HARD_ERROR;
@@ -10975,8 +12480,11 @@ static enum transmit_result transmit(conn *c) {
         }
         /* if res == 0 or res == -1 and error is not EAGAIN or EWOULDBLOCK,
            we have a real error, on which we close the connection */
-        if (settings.verbose > 0)
-            perror("Failed to write, and not due to blocking");
+        if (settings.verbose > 0) {
+            mc_logger->log(EXTENSION_LOG_INFO, c,
+                           "Failed to write, and not due to blocking.\n");
+            //perror("Failed to write, and not due to blocking");
+        }
 
         if (IS_UDP(c->transport))
             conn_set_state(c, conn_read);
@@ -11049,8 +12557,8 @@ bool conn_listening(conn *c)
 bool conn_waiting(conn *c) {
     if (!update_event(c, EV_READ | EV_PERSIST)) {
         if (settings.verbose > 0) {
-            mc_logger->log(EXTENSION_LOG_INFO, c,
-                           "Couldn't update event\n");
+            mc_logger->log(EXTENSION_LOG_WARNING, c,
+                           "Couldn't update event in conn_waiting.\n");
         }
         conn_set_state(c, conn_closing);
         return true;
@@ -11130,8 +12638,8 @@ bool conn_new_cmd(conn *c) {
             */
             if (!update_event(c, EV_WRITE | EV_PERSIST)) {
                 if (settings.verbose > 0) {
-                    mc_logger->log(EXTENSION_LOG_INFO, c,
-                                   "Couldn't update event\n");
+                    mc_logger->log(EXTENSION_LOG_WARNING, c,
+                                   "Couldn't update event in conn_new_cmd.\n");
                 }
                 conn_set_state(c, conn_closing);
                 return true;
@@ -11169,14 +12677,18 @@ bool conn_swallow(conn *c) {
         return true;
     }
     if (res == 0) { /* end of stream */
+        if (settings.verbose > 0) {
+            mc_logger->log(EXTENSION_LOG_INFO, c,
+                           "Couldn't read in conn_swallow: end of stream.\n");
+        }
         conn_set_state(c, conn_closing);
         return true;
     }
     if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         if (!update_event(c, EV_READ | EV_PERSIST)) {
             if (settings.verbose > 0) {
-                mc_logger->log(EXTENSION_LOG_INFO, c,
-                               "Couldn't update event\n");
+                mc_logger->log(EXTENSION_LOG_WARNING, c,
+                               "Couldn't update event in conn_swallow.\n");
             }
             conn_set_state(c, conn_closing);
             return true;
@@ -11186,8 +12698,13 @@ bool conn_swallow(conn *c) {
 
     if (errno != ENOTCONN && errno != ECONNRESET) {
         /* otherwise we have a real error, on which we close the connection */
+        mc_logger->log(EXTENSION_LOG_WARNING, c,
+                "Failed to read in conn_swallow, and not due to blocking: err=(%d:%s)\n",
+                errno, strerror(errno));
+    } else {
         mc_logger->log(EXTENSION_LOG_INFO, c,
-                "Failed to read, and not due to blocking (%s)\n", strerror(errno));
+                "Failed to read in conn_swallow, and not due to blocking: err=(%d:%s)\n",
+                errno, strerror(errno));
     }
 
     conn_set_state(c, conn_closing);
@@ -11248,14 +12765,18 @@ bool conn_nread(conn *c) {
         return true;
     }
     if (res == 0) { /* end of stream */
+        if (settings.verbose > 0) {
+            mc_logger->log(EXTENSION_LOG_INFO, c,
+                           "Couldn't read in conn_nread: end of stream.\n");
+        }
         conn_set_state(c, conn_closing);
         return true;
     }
     if (res == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         if (!update_event(c, EV_READ | EV_PERSIST)) {
             if (settings.verbose > 0) {
-                mc_logger->log(EXTENSION_LOG_INFO, c,
-                               "Couldn't update event\n");
+                mc_logger->log(EXTENSION_LOG_WARNING, c,
+                               "Couldn't update event in conn_nread.\n");
             }
             conn_set_state(c, conn_closing);
             return true;
@@ -11266,8 +12787,14 @@ bool conn_nread(conn *c) {
     if (errno != ENOTCONN && errno != ECONNRESET) {
         /* otherwise we have a real error, on which we close the connection */
         mc_logger->log(EXTENSION_LOG_WARNING, c,
-                       "Failed to read, and not due to blocking:\n"
-                       "errno: %d %s \n"
+                       "Failed to read in conn_nread, and not due to blocking: err=(%d:%s)\n"
+                       "rcurr=%lx ritem=%lx rbuf=%lx rlbytes=%d rsize=%d\n",
+                       errno, strerror(errno),
+                       (long)c->rcurr, (long)c->ritem, (long)c->rbuf,
+                       (int)c->rlbytes, (int)c->rsize);
+    } else {
+        mc_logger->log(EXTENSION_LOG_INFO, c,
+                       "Failed to read in conn_nread, and not due to blocking: err=(%d:%s)\n"
                        "rcurr=%lx ritem=%lx rbuf=%lx rlbytes=%d rsize=%d\n",
                        errno, strerror(errno),
                        (long)c->rcurr, (long)c->ritem, (long)c->rbuf,
@@ -11286,8 +12813,8 @@ bool conn_write(conn *c) {
     if (c->iovused == 0 || (IS_UDP(c->transport) && c->iovused == 1)) {
         if (add_iov(c, c->wcurr, c->wbytes) != 0) {
             if (settings.verbose > 0) {
-                mc_logger->log(EXTENSION_LOG_INFO, c,
-                               "Couldn't build response\n");
+                mc_logger->log(EXTENSION_LOG_WARNING, c,
+                               "Couldn't build response in conn_write.\n");
             }
             conn_set_state(c, conn_closing);
             return true;
@@ -11305,8 +12832,8 @@ bool conn_mwrite(conn *c) {
 
     if (IS_UDP(c->transport) && c->msgcurr == 0 && build_udp_headers(c) != 0) {
         if (settings.verbose > 0) {
-            mc_logger->log(EXTENSION_LOG_INFO, c,
-                           "Failed to build UDP headers\n");
+            mc_logger->log(EXTENSION_LOG_WARNING, c,
+                           "Failed to build UDP headers in conn_mwrite.\n");
         }
         conn_set_state(c, conn_closing);
         return true;
@@ -11333,6 +12860,12 @@ bool conn_mwrite(conn *c) {
                 c->suffixcurr++;
                 c->suffixleft--;
             }
+#ifdef DETECT_LONG_QUERY
+            if (c->lq_bufcnt != 0) {
+                lqdetect_buffer_release(c->lq_bufcnt);
+                c->lq_bufcnt = 0;
+            }
+#endif
             if (c->coll_eitem != NULL) {
                 conn_coll_eitem_free(c);
             }
@@ -11350,9 +12883,8 @@ bool conn_mwrite(conn *c) {
             conn_set_state(c, c->write_and_go);
         } else {
             if (settings.verbose > 0) {
-                mc_logger->log(EXTENSION_LOG_INFO, c,
-                        "Unexpected state %p\n", (void*)((uintptr_t)c->state));
-                /* No standard way of printing a function pointer... */
+                mc_logger->log(EXTENSION_LOG_WARNING, c,
+                        "Unexpected state %s\n", state_text(c->state));
             }
             conn_set_state(c, conn_closing);
         }
@@ -11385,8 +12917,23 @@ void event_handler(const int fd, const short which, void *arg) {
     assert(c != NULL);
 
     if (memcached_shutdown) {
-        event_base_loopbreak(c->event.ev_base);
-        return ;
+        if (c->thread == NULL) {
+            if (settings.verbose > 0) {
+                mc_logger->log(EXTENSION_LOG_INFO, c,
+                        "Main thread is now terminating from event handler.\n");
+            }
+            event_base_loopbreak(c->event.ev_base);
+            return ;
+        }
+        if (memcached_shutdown > 1) {
+            if (settings.verbose > 0) {
+                mc_logger->log(EXTENSION_LOG_INFO, c,
+                        "Worker thread[%d] is now terminating from event handler.\n",
+                        c->thread->index);
+            }
+            event_base_loopbreak(c->event.ev_base);
+            return ;
+        }
     }
 
     c->which = which;
@@ -11705,6 +13252,10 @@ static void clock_handler(const int fd, const short which, void *arg) {
     static bool initialized = false;
 
     if (memcached_shutdown) {
+        if (settings.verbose > 0) {
+            mc_logger->log(EXTENSION_LOG_INFO, NULL,
+                    "Main thread is now terminating from clock handler.\n");
+        }
         event_base_loopbreak(main_base);
         return ;
     }
@@ -11996,6 +13547,11 @@ static int get_socket_fd(const void *cookie) {
 static const char* get_client_ip(const void *cookie) {
     conn *c = (conn *)cookie;
     return (c != NULL ? c->client_ip : "null");
+}
+
+static int get_thread_index(const void *cookie) {
+    conn *c = (conn *)cookie;
+    return c->thread->index;
 }
 
 static int num_independent_stats(void) {
@@ -12302,7 +13858,8 @@ static void* get_extension(extension_type_t type)
 static bool is_zk_integrated(void)
 {
 #ifdef ENABLE_ZK_INTEGRATION
-    return (arcus_zk_cfg ? true : false);
+    if (arcus_zk_cfg)
+        return true;
 #endif
     return false;
 }
@@ -12310,8 +13867,12 @@ static bool is_zk_integrated(void)
 static bool is_my_key(const char *key, size_t nkey)
 {
 #ifdef ENABLE_ZK_INTEGRATION
-    if (arcus_zk_cfg && arcus_cluster_is_valid()) {
-        return arcus_key_is_mine(key, nkey);
+    if (arcus_zk_cfg) {
+        bool mine;
+        if (arcus_key_is_mine(key, nkey, &mine) == 0) {
+            return mine;
+        }
+        /* The cluster is invalid: go downward and return true */
     }
 #endif
     return true;
@@ -12375,6 +13936,7 @@ static SERVER_HANDLE_V1 *get_server_api(void)
         .get_engine_specific = get_engine_specific,
         .get_socket_fd = get_socket_fd,
         .get_client_ip = get_client_ip,
+        .get_thread_index = get_thread_index,
         .server_version = get_server_version,
         .hash = mc_hash,
         .realtime = realtime,
@@ -12502,6 +14064,20 @@ static bool sanitycheck(void) {
     }
 
     return true;
+}
+
+static void close_listen_sockets(void)
+{
+    struct conn *conn;
+
+    /* Just close listen sockets only.
+     * We do not free listen connections.
+     */
+    conn = listen_conn;
+    while (conn != NULL) {
+        close(conn->sfd);
+        conn = conn->next;
+    }
 }
 
 int main (int argc, char **argv) {
@@ -12878,6 +14454,9 @@ int main (int argc, char **argv) {
         settings.port = settings.udpport;
     }
 
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    /* Following code of setting max collection size will be deprecated. */
+#endif
     if (1) { /* check max collection size from environment variables */
         int value;
 
@@ -12914,6 +14493,11 @@ int main (int argc, char **argv) {
                          value, MAX_BTREE_SIZE, ARCUS_COLL_SIZE_LIMIT);
             }
         }
+        /* reset maximum elements of each collection */
+        settings.max_list_size = MAX_LIST_SIZE;
+        settings.max_set_size = MAX_SET_SIZE;
+        settings.max_btree_size = MAX_BTREE_SIZE;
+
         old_opts += sprintf(old_opts, "max_list_size=%d;",  MAX_LIST_SIZE);
         old_opts += sprintf(old_opts, "max_set_size=%d;",   MAX_SET_SIZE);
         old_opts += sprintf(old_opts, "max_btree_size=%d;", MAX_BTREE_SIZE);
@@ -13105,6 +14689,19 @@ int main (int argc, char **argv) {
     }
 #endif
 
+#ifdef COMMAND_LOGGING
+    /* initialise command logging */
+    cmdlog_init(settings.port, mc_logger);
+#endif
+
+#ifdef DETECT_LONG_QUERY
+    if (lqdetect_init() == -1) {
+        mc_logger->log(EXTENSION_LOG_WARNING, NULL,
+                "Can't allocate long query detection buffer\n");
+        exit(EXIT_FAILURE);
+    }
+#endif
+
     /* start up worker threads if MT mode */
     thread_init(settings.num_threads, main_base);
 
@@ -13188,31 +14785,43 @@ int main (int argc, char **argv) {
     /* enter the event loop */
     event_base_loop(main_base, 0);
 
-    if (settings.verbose) {
-        mc_logger->log(EXTENSION_LOG_INFO, NULL, "Initiating shutdown\n");
-    }
-    threads_shutdown();
+    mc_logger->log(EXTENSION_LOG_INFO, NULL, "Initiating arcus memcached shutdown...\n");
+
+    /* remove the PID file if we're a daemon */
+    if (do_daemonize)
+        remove_pidfile(pid_file);
 
 #ifdef ENABLE_ZK_INTEGRATION
-    // shutdown Arcus connection
+    /* shutdown arcus ZK connection */
     if (arcus_zk_cfg) {
         arcus_zk_final("graceful shutdown");
         free(arcus_zk_cfg);
     }
 #endif
 
-    mc_engine.v1->destroy(mc_engine.v0);
+    close_listen_sockets();
+    mc_logger->log(EXTENSION_LOG_INFO, NULL, "Listen sockets closed.\n");
 
-    /* remove the PID file if we're a daemon */
-    if (do_daemonize)
-        remove_pidfile(pid_file);
+    memcached_shutdown = 2;
+    threads_shutdown();
+    mc_logger->log(EXTENSION_LOG_INFO, NULL, "Worker threads terminated.\n");
+
+#ifdef COMMAND_LOGGING
+    /* destroy command logging */
+    cmdlog_final();
+#endif
+
+#ifdef DETECT_LONG_QUERY
+    lqdetect_final();
+#endif
+
+    mc_engine.v1->destroy(mc_engine.v0);
+    mc_logger->log(EXTENSION_LOG_INFO, NULL, "Memcached engine destroyed.\n");
+
     /* Clean up strdup() call for bind() address */
     if (settings.inter)
       free(settings.inter);
 
-    if (settings.verbose) {
-        mc_logger->log(EXTENSION_LOG_INFO, NULL, "Arcus memcached terminated.\n");
-    }
-
+    mc_logger->log(EXTENSION_LOG_INFO, NULL, "Arcus memcached terminated.\n");
     return EXIT_SUCCESS;
 }

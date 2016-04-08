@@ -1,6 +1,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,10 +18,7 @@
 #ifndef ITEMS_H
 #define ITEMS_H
 
-/*
- * You should not try to aquire any of the item locks before calling these
- * functions.
- */
+/* hash item strtucture */
 typedef struct _hash_item {
     uint16_t refcount;  /* reference count */
     uint8_t  slabs_clsid;/* which slab class we're in */
@@ -32,12 +30,12 @@ typedef struct _hash_item {
     rel_time_t time;    /* least recent access */
     rel_time_t exptime; /* When the item will expire (relative to process startup) */
     uint16_t iflag;     /* Intermal flags.
-                         * lower 8 bit is reserved for the core server,
-                         * the upper 8 bits is reserved for engine implementation.
+                         * Lower 8 bits are reserved for the core server,
+                         * Upper 8 bits are reserved for engine implementation.
                          */
     uint8_t  nkey;      /* The total length of the key (in bytes) */
     uint8_t  nprefix;   /* The prefix length of the key (in bytes) */
-    uint32_t nbytes;    /* The total size of the data (in bytes) */
+    uint32_t nbytes;    /* The total length of the data (in bytes) */
 } hash_item;
 
 /* list element */
@@ -192,6 +190,7 @@ typedef struct _coll_meta_info {
     void    *prefix;    /* pointer to prefix meta info */
 } coll_meta_info;
 
+/* item stats */
 typedef struct {
     unsigned int evicted;
     unsigned int evicted_nonzero;
@@ -201,6 +200,7 @@ typedef struct {
     unsigned int reclaimed;
 } itemstats_t;
 
+/* item global */
 struct items {
    hash_item   *heads[MAX_NUMBER_OF_SLAB_CLASSES];
    hash_item   *tails[MAX_NUMBER_OF_SLAB_CLASSES];
@@ -223,6 +223,10 @@ typedef struct {
    unsigned int size;
 } item_queue;
 
+/*
+ * You should not try to aquire any of the item locks before calling these
+ * functions.
+ */
 
 /**
  * Allocate and initialize a new item structure
@@ -305,13 +309,6 @@ ENGINE_ERROR_CODE item_flush_prefix_expired(struct default_engine *engine,
 void item_release(struct default_engine *engine, hash_item *it);
 
 /**
- * Unlink the item from the hash table (make it inaccessible)
- * @param engine handle to the storage engine
- * @param it the item to unlink
- */
-void item_unlink(struct default_engine *engine, hash_item *it);
-
-/**
  * Store an item in the cache
  * @param engine handle to the storage engine
  * @param item the item to store
@@ -332,26 +329,22 @@ ENGINE_ERROR_CODE arithmetic(struct default_engine *engine, const void* cookie,
                              const int flags, const rel_time_t exptime, uint64_t *cas,
                              uint64_t *result);
 
-
 /**
- * Add a delta to an item
+ * Delete an item of the given key.
  * @param engine handle to the storage engine
- * @param item the item to operate on
- * @param incr true if we want to increment, false for decrement
- * @param delta the amount to incr/decr
- * @param cas the new cas value (OUT)
- * @param result the new value for the item (OUT)
- * @return ENGINE_SUCCESS on success
- *
- * @todo perhaps we should do the same refactor as suggested for
- *       store_item
+ * @param key the key to delete
+ * @param nkey the number of bytes in the key
+ * @param cas the cas value
  */
-ENGINE_ERROR_CODE add_delta(struct default_engine *engine, hash_item *item, const bool incr,
-                            const int64_t delta, uint64_t *cas, uint64_t *result, const void *cookie);
+ENGINE_ERROR_CODE item_delete(struct default_engine *engine,
+                              const void* key, const size_t nkey,
+                              uint64_t cas);
 
 void coll_del_thread_wakeup(struct default_engine *engine);
 
 ENGINE_ERROR_CODE item_init(struct default_engine *engine);
+
+void              item_final(struct default_engine *engine);
 
 ENGINE_ERROR_CODE list_struct_create(struct default_engine *engine,
                                      const char *key, const size_t nkey,
@@ -441,7 +434,7 @@ ENGINE_ERROR_CODE btree_elem_delete(struct default_engine *engine,
                                     const char *key, const size_t nkey,
                                     const bkey_range *bkrange, const eflag_filter *efilter,
                                     const uint32_t req_count, const bool drop_if_empty,
-                                    uint32_t *del_count, bool *dropped);
+                                    uint32_t *del_count, uint32_t *access_count, bool *dropped);
 
 ENGINE_ERROR_CODE btree_elem_arithmetic(struct default_engine *engine,
                                         const char* key, const size_t nkey,
@@ -457,12 +450,13 @@ ENGINE_ERROR_CODE btree_elem_get(struct default_engine *engine,
                                  const uint32_t offset, const uint32_t req_count,
                                  const bool delete, const bool drop_if_empty,
                                  btree_elem_item **elem_array, uint32_t *elem_count,
+                                 uint32_t *access_count,
                                  uint32_t *flags, bool *dropped_trimmed);
 
 ENGINE_ERROR_CODE btree_elem_count(struct default_engine *engine,
                                    const char *key, const size_t nkey,
                                    const bkey_range *bkrange, const eflag_filter *efilter,
-                                   uint32_t *elem_count, uint32_t *flags);
+                                   uint32_t *elem_count, uint32_t *access_count);
 
 ENGINE_ERROR_CODE btree_posi_find(struct default_engine *engine,
                                   const char *key, const size_t nkey, const bkey_range *bkrange,
@@ -481,6 +475,25 @@ ENGINE_ERROR_CODE btree_elem_get_by_posi(struct default_engine *engine,
                                   btree_elem_item **elem_array, uint32_t *elem_count, uint32_t *flags);
 
 #ifdef SUPPORT_BOP_SMGET
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+ENGINE_ERROR_CODE btree_elem_smget_old(struct default_engine *engine,
+                                   token_t *key_array, const int key_count,
+                                   const bkey_range *bkrange, const eflag_filter *efilter,
+                                   const uint32_t offset, const uint32_t count,
+                                   btree_elem_item **elem_array, uint32_t *kfnd_array,
+                                   uint32_t *flag_array, uint32_t *elem_count,
+                                   uint32_t *missed_key_array, uint32_t *missed_key_count,
+                                   bool *trimmed, bool *duplicated);
+#endif
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+ENGINE_ERROR_CODE btree_elem_smget(struct default_engine *engine,
+                                   token_t *key_array, const int key_count,
+                                   const bkey_range *bkrange, const eflag_filter *efilter,
+                                   const uint32_t offset, const uint32_t count,
+                                   const bool unique,
+                                   smget_result_t *result);
+#else
 ENGINE_ERROR_CODE btree_elem_smget(struct default_engine *engine,
                                    token_t *key_array, const int key_count,
                                    const bkey_range *bkrange, const eflag_filter *efilter,
@@ -489,6 +502,7 @@ ENGINE_ERROR_CODE btree_elem_smget(struct default_engine *engine,
                                    uint32_t *flag_array, uint32_t *elem_count,
                                    uint32_t *missed_key_array, uint32_t *missed_key_count,
                                    bool *trimmed, bool *duplicated);
+#endif
 #endif
 
 ENGINE_ERROR_CODE item_getattr(struct default_engine *engine,
@@ -504,6 +518,10 @@ ENGINE_ERROR_CODE item_setattr(struct default_engine *engine,
 /*
  * Item config functions
  */
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+ENGINE_ERROR_CODE item_conf_set_maxcollsize(struct default_engine *engine,
+                                            const int coll_type, int *maxsize);
+#endif
 bool item_conf_get_evict_to_free(struct default_engine *engine);
 void item_conf_set_evict_to_free(struct default_engine *engine, bool value);
 
@@ -545,5 +563,23 @@ bool item_start_scrub(struct default_engine *engine, int mode);
  * Get the item scrubber statitistics
  */
 void item_stats_scrub(struct default_engine *engine, ADD_STAT add_stat, const void *cookie);
+
+#ifdef JHPARK_KEY_DUMP
+enum dump_op {
+    DUMP_OP_START = 1, /* dump start */
+    DUMP_OP_STOP  = 2  /* dump stop */
+};
+enum dump_mode {
+    DUMP_MODE_NONE = 0,
+    DUMP_MODE_KEY  = 1, /* key string only */
+    DUMP_MODE_ITEM = 2  /* key string & item value */
+};
+ENGINE_ERROR_CODE item_dump(struct default_engine *engine,
+                            enum dump_op oper, enum dump_mode mode,
+                            const char *prefix, const int nprefix,
+                            const char *filepath);
+void item_stats_dump(struct default_engine *engine,
+                     ADD_STAT add_stat, const void *cookie);
+#endif
 
 #endif

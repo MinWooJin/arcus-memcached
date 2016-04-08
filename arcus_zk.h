@@ -1,5 +1,6 @@
 /*
  * arcus-memcached - Arcus memory cache server
+ * Copyright 2010-2014 NAVER Corp.
  * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,8 +51,10 @@ int  arcus_zk_get_hbfailstop(void);
 void arcus_zk_get_stats(arcus_zk_stats *stats);
 
 #ifdef ENABLE_CLUSTER_AWARE
-bool arcus_cluster_is_valid(void);
-bool arcus_key_is_mine(const char *key, size_t nkey);
+int  arcus_key_is_mine(const char *key, size_t nkey, bool *mine);
+uint32_t arcus_gen_ketama_hash(const char *key, size_t nkey);
+uint32_t arcus_find_hslice_index(uint32_t hvalue);
+//uint32_t arcus_gen_ketama_hash(const char *key, size_t nkey, int *hashidx);
 #endif
 
 #endif /* ENABLE_ZK_INTEGRATION */

@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,25 +58,14 @@ enum elem_delete_cause {
 /* Forward Declarations */
 static void item_link_q(struct default_engine *engine, hash_item *it);
 static void item_unlink_q(struct default_engine *engine, hash_item *it);
-static hash_item *do_item_alloc(struct default_engine *engine,
-                                const void *key, const size_t nkey,
-                                const int flags, const rel_time_t exptime,
-                                const int nbytes, const void *cookie);
-static hash_item *do_item_get(struct default_engine *engine,
-                              const char *key, const size_t nkey,
-                              bool LRU_reposition);
 static ENGINE_ERROR_CODE do_item_link(struct default_engine *engine, hash_item *it);
-static void do_item_unlink(struct default_engine *engine, hash_item *it,
-                           enum item_unlink_cause cause);
-static void do_item_release(struct default_engine *engine, hash_item *it);
-static void do_item_update(struct default_engine *engine, hash_item *it);
-static void do_item_lru_reposition(struct default_engine *engine, hash_item *it);
-static ENGINE_ERROR_CODE do_item_replace(struct default_engine *engine,
-                                         hash_item *it, hash_item *new_it);
-static void do_item_free(struct default_engine *engine, hash_item *it);
-static void push_coll_del_queue(struct default_engine *engine, hash_item *it);
+static void do_item_unlink(struct default_engine *engine, hash_item *it, enum item_unlink_cause cause);
 static void do_coll_all_elem_delete(struct default_engine *engine, hash_item *it);
-extern int  genhash_string_hash(const void* p, size_t nkey);
+#ifdef JHPARK_KEY_DUMP
+static void do_item_dump_stop(struct default_engine *engine);
+#endif
+
+extern int genhash_string_hash(const void* p, size_t nkey);
 
 /*
  * We only reposition items in the LRU queue if they haven't been repositioned
@@ -238,10 +228,9 @@ static uint64_t get_cas_id(void)
 /* Enable this for reference-count debugging. */
 #if 0
 # define DEBUG_REFCNT(it,op) \
-         fprintf(stderr, "item %x refcnt(%c) %d %c%c%c\n", \
+         fprintf(stderr, "item %x refcnt(%c) %d %c\n", \
                         it, op, it->refcount, \
-                        (it->it_flags & ITEM_LINKED) ? 'L' : ' ', \
-                        (it->it_flags & ITEM_SLABBED) ? 'S' : ' ')
+                        (it->it_flags & ITEM_LINKED) ? 'L' : ' ')
 #else
 # define DEBUG_REFCNT(it,op) while(0)
 #endif
@@ -275,6 +264,45 @@ static void decrease_collection_space(struct default_engine *engine, ENGINE_ITEM
     assoc_prefix_update_size(info->prefix, item_type, dec_space, false);
     engine->stats.curr_bytes -= dec_space;
     //pthread_mutex_unlock(&engine->stats.lock);
+}
+
+/*
+ * Collection Delete Queue Management
+ */
+static void push_coll_del_queue(struct default_engine *engine, hash_item *it)
+{
+    /* push the item into the tail of delete queue */
+    it->next = NULL;
+    pthread_mutex_lock(&engine->coll_del_lock);
+    if (engine->coll_del_queue.tail == NULL) {
+        engine->coll_del_queue.head = it;
+    } else {
+        engine->coll_del_queue.tail->next = it;
+    }
+    engine->coll_del_queue.tail = it;
+    engine->coll_del_queue.size++;
+    if (engine->coll_del_sleep == true) {
+        /* wake up collection delete thead */
+        pthread_cond_signal(&engine->coll_del_cond);
+    }
+    pthread_mutex_unlock(&engine->coll_del_lock);
+}
+
+static hash_item *pop_coll_del_queue(struct default_engine *engine)
+{
+    /* pop an item from the head of delete queue */
+    hash_item *it = NULL;
+    pthread_mutex_lock(&engine->coll_del_lock);
+    if (engine->coll_del_queue.head != NULL) {
+        it = engine->coll_del_queue.head;
+        engine->coll_del_queue.head = it->next;
+        if (engine->coll_del_queue.head == NULL) {
+            engine->coll_del_queue.tail = NULL;
+        }
+        engine->coll_del_queue.size--;
+    }
+    pthread_mutex_unlock(&engine->coll_del_lock);
+    return it;
 }
 
 static bool do_item_isvalid(struct default_engine *engine, hash_item *it, rel_time_t current_time)
@@ -719,7 +747,6 @@ static void do_item_free(struct default_engine *engine, hash_item *it)
     /* so slab size changer can tell later if item is already free or not */
     clsid = it->slabs_clsid;
     it->slabs_clsid = 0;
-    it->iflag |= ITEM_SLABBED;
     DEBUG_REFCNT(it, 'F');
     slabs_free(engine, it, ntotal, clsid);
 }
@@ -728,7 +755,6 @@ static void item_link_q(struct default_engine *engine, hash_item *it)
 {
     hash_item **head, **tail;
     assert(it->slabs_clsid <= POWER_LARGEST);
-    assert((it->iflag & ITEM_SLABBED) == 0);
 
 #ifdef USE_SINGLE_LRU_LIST
     int clsid = 1;
@@ -837,13 +863,18 @@ static void item_unlink_q(struct default_engine *engine, hash_item *it)
 
 static ENGINE_ERROR_CODE do_item_link(struct default_engine *engine, hash_item *it)
 {
-    MEMCACHED_ITEM_LINK(item_get_key(it), it->nkey, it->nbytes);
-    assert((it->iflag & (ITEM_LINKED|ITEM_SLABBED)) == 0);
+    const char *key = item_get_key(it);
+    size_t stotal;
+    assert((it->iflag & ITEM_LINKED) == 0);
     assert(it->nbytes < (1024 * 1024));  /* 1MB max size */
 
-    size_t stotal = ITEM_stotal(engine, it);
+    MEMCACHED_ITEM_LINK(key, it->nkey, it->nbytes);
 
-    /* link given item to prefix */
+    /* Allocate a new CAS ID on link. */
+    item_set_cas(it, get_cas_id());
+
+    /* link the item to prefix info */
+    stotal = ITEM_stotal(engine, it);
     prefix_t *pt;
     ENGINE_ERROR_CODE ret = assoc_prefix_link(engine, it, stotal, &pt);
     if (ret != ENGINE_SUCCESS) {
@@ -855,10 +886,15 @@ static ENGINE_ERROR_CODE do_item_link(struct default_engine *engine, hash_item *
         assert(info->stotal == 0); /* Only empty collection can be linked */
     }
 
+    /* link the item to the hash table */
     it->iflag |= ITEM_LINKED;
     it->time = engine->server.core->get_current_time();
-    assoc_insert(engine, engine->server.core->hash(item_get_key(it), it->nkey, 0), it);
+    assoc_insert(engine, engine->server.core->hash(key, it->nkey, 0), it);
 
+    /* link the item to LRU list */
+    item_link_q(engine, it);
+
+    /* update item statistics */
     pthread_mutex_lock(&engine->stats.lock);
 #ifdef ENABLE_STICKY_ITEM
     if (it->exptime == (rel_time_t)(-1)) { /* sticky item */
@@ -871,11 +907,6 @@ static ENGINE_ERROR_CODE do_item_link(struct default_engine *engine, hash_item *
     engine->stats.total_items += 1;
     pthread_mutex_unlock(&engine->stats.lock);
 
-    /* Allocate a new CAS ID on link. */
-    item_set_cas(it, get_cas_id());
-
-    item_link_q(engine, it);
-
     return ENGINE_SUCCESS;
 }
 
@@ -884,13 +915,29 @@ static void do_item_unlink(struct default_engine *engine, hash_item *it,
 {
     /* cause: item unlink cause will be used, later
     */
+    const char *key = item_get_key(it);
+    size_t stotal;
+    MEMCACHED_ITEM_UNLINK(key, it->nkey, it->nbytes);
 
-    MEMCACHED_ITEM_UNLINK(item_get_key(it), it->nkey, it->nbytes);
     if ((it->iflag & ITEM_LINKED) != 0) {
+        /* unlink the item from LUR list */
+        item_unlink_q(engine, it);
+
+        /* unlink the item from hash table */
+        assoc_delete(engine, engine->server.core->hash(key, it->nkey, 0),
+                     key, it->nkey);
         it->iflag &= ~ITEM_LINKED;
 
-        size_t stotal = ITEM_stotal(engine, it);
+        /* unlink the item from prefix info */
+        stotal = ITEM_stotal(engine, it);
+        assoc_prefix_unlink(engine, it, stotal);
+        if (IS_COLL_ITEM(it)) {
+            coll_meta_info *info = (coll_meta_info *)item_get_meta(it);
+            info->prefix = NULL;
+            info->stotal = 0; /* Don't need to decrease space statistics any more */
+        }
 
+        /* update item statistics */
         pthread_mutex_lock(&engine->stats.lock);
 #ifdef ENABLE_STICKY_ITEM
         if (it->exptime == (rel_time_t)(-1)) { /* sticky item */
@@ -902,16 +949,7 @@ static void do_item_unlink(struct default_engine *engine, hash_item *it,
         engine->stats.curr_items -= 1;
         pthread_mutex_unlock(&engine->stats.lock);
 
-        /* unlink given item from prefix */
-        assoc_prefix_unlink(engine, it, stotal);
-        if (IS_COLL_ITEM(it)) {
-            coll_meta_info *info = (coll_meta_info *)item_get_meta(it);
-            info->prefix = NULL;
-            info->stotal = 0; /* Don't need to decrease space statistics any more */
-        }
-        assoc_delete(engine, engine->server.core->hash(item_get_key(it), it->nkey, 0),
-                     item_get_key(it), it->nkey);
-        item_unlink_q(engine, it);
+        /* free the item if no one reference it */
         if (it->refcount == 0) {
             do_item_free(engine, it);
         }
@@ -932,7 +970,13 @@ static void do_item_release(struct default_engine *engine, hash_item *it)
         }
         else if (it->prev == it && it->next == it) {
             /* link the item into the LRU list */
-            item_link_q(engine, it);
+            rel_time_t current_time = engine->server.core->get_current_time();
+            if (do_item_isvalid(engine, it, current_time)) {
+                it->time = current_time;
+                item_link_q(engine, it);
+            } else {
+                do_item_unlink(engine, it, ITEM_UNLINK_INVALID);
+            }
         }
     }
 #else
@@ -947,8 +991,6 @@ static void do_item_update(struct default_engine *engine, hash_item *it)
     rel_time_t current_time = engine->server.core->get_current_time();
     MEMCACHED_ITEM_UPDATE(item_get_key(it), it->nkey, it->nbytes);
     if (it->time < current_time - ITEM_UPDATE_INTERVAL) {
-        assert((it->iflag & ITEM_SLABBED) == 0);
-
         if ((it->iflag & ITEM_LINKED) != 0) {
             item_unlink_q(engine, it);
             it->time = current_time;
@@ -959,7 +1001,6 @@ static void do_item_update(struct default_engine *engine, hash_item *it)
 
 static void do_item_lru_reposition(struct default_engine *engine, hash_item *it)
 {
-    assert((it->iflag & ITEM_SLABBED) == 0);
     if ((it->iflag & ITEM_LINKED) != 0) {
         item_unlink_q(engine, it);
         it->time = engine->server.core->get_current_time();
@@ -972,8 +1013,6 @@ static ENGINE_ERROR_CODE do_item_replace(struct default_engine *engine,
 {
     MEMCACHED_ITEM_REPLACE(item_get_key(it), it->nkey, it->nbytes,
                            item_get_key(new_it), new_it->nkey, new_it->nbytes);
-    assert((it->iflag & ITEM_SLABBED) == 0);
-
     do_item_unlink(engine, it, ITEM_UNLINK_REPLACE);
     ENGINE_ERROR_CODE ret = do_item_link(engine, new_it);
     assert(ret == ENGINE_SUCCESS);
@@ -1359,17 +1398,29 @@ static int32_t do_coll_real_maxcount(hash_item *it, int32_t maxcount)
 
     if (IS_LIST_ITEM(it)) {
         if (maxcount < 0 || maxcount > max_list_size)
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+            real_maxcount = -1;
+#else
             real_maxcount = max_list_size;
+#endif
         else if (maxcount == 0)
             real_maxcount = default_list_size;
     } else if (IS_SET_ITEM(it)) {
         if (maxcount < 0 || maxcount > max_set_size)
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+            real_maxcount = -1;
+#else
             real_maxcount = max_set_size;
+#endif
         else if (maxcount == 0)
             real_maxcount = default_set_size;
     } else if (IS_BTREE_ITEM(it)) {
         if (maxcount < 0 || maxcount > max_btree_size)
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+            real_maxcount = -1;
+#else
             real_maxcount = max_btree_size;
+#endif
         else if (maxcount == 0)
             real_maxcount = default_btree_size;
     }
@@ -1602,6 +1653,85 @@ static uint32_t do_list_elem_get(struct default_engine *engine,
         elem = tobe;
     }
     return fcnt;
+}
+
+static ENGINE_ERROR_CODE do_list_elem_insert(struct default_engine *engine,
+                                             hash_item *it,
+                                             int index, list_elem_item *elem,
+                                             const void *cookie)
+{
+    list_meta_info *info = (list_meta_info *)item_get_meta(it);
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    int32_t real_mcnt = (info->mcnt == -1 ? max_list_size : info->mcnt);
+#endif
+    ENGINE_ERROR_CODE ret;
+
+    /* validation check: index value */
+    if (index >= 0) {
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+        if (index > info->ccnt || index > (real_mcnt-1))
+#else
+        if (index > info->ccnt || index > (info->mcnt-1))
+#endif
+            return ENGINE_EINDEXOOR;
+    } else {
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+        if ((-index) > (info->ccnt+1) || (-index) > real_mcnt)
+#else
+        if ((-index) > (info->ccnt+1) || (-index) > info->mcnt)
+#endif
+            return ENGINE_EINDEXOOR;
+    }
+
+#ifdef ENABLE_STICKY_ITEM
+    /* sticky memory limit check */
+    if ((info->mflags & COLL_META_FLAG_STICKY) != 0) {
+        if (engine->stats.sticky_bytes >= engine->config.sticky_limit)
+            return ENGINE_ENOMEM;
+    }
+#endif
+
+    /* overflow check */
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    if (info->ovflact == OVFL_ERROR && info->ccnt >= real_mcnt) {
+        return ENGINE_EOVERFLOW;
+    }
+#else
+    if (info->ovflact == OVFL_ERROR && info->ccnt >= info->mcnt) {
+        return ENGINE_EOVERFLOW;
+    }
+#endif
+
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    if (info->ccnt >= real_mcnt)
+#else
+    if (info->ccnt >= info->mcnt)
+#endif
+    {
+        /* info->ovflact: OVFL_HEAD_TRIM or OVFL_TAIL_TRIM */
+        int      delidx;
+        uint32_t delcnt;
+        if (index == 0 || index == -1) {
+            /* delete an element item of opposite side to make room */
+            delidx = (index == -1 ? 0 : -1);
+            delcnt = do_list_elem_delete(engine, info, delidx, 1, ELEM_DELETE_TRIM);
+            assert(delcnt == 1);
+        } else {
+            /* delete an element item that overflow action indicates */
+            delidx = (info->ovflact == OVFL_HEAD_TRIM ? 0 : -1);
+            delcnt = do_list_elem_delete(engine, info, delidx, 1, ELEM_DELETE_TRIM);
+            assert(delcnt == 1);
+            /* adjust list index value */
+            if (info->ovflact == OVFL_HEAD_TRIM) {
+              if (index > 0) index -= 1;
+            } else { /* ovflact == OVFL_TAIL_TRIM */
+              if (index < 0) index += 1;
+            }
+        }
+    }
+
+    ret = do_list_elem_link(engine, info, index, elem);
+    return ret;
 }
 
 /*
@@ -2059,6 +2189,57 @@ static uint32_t do_set_elem_get(struct default_engine *engine,
         }
     }
     return fcnt;
+}
+
+static ENGINE_ERROR_CODE do_set_elem_insert(struct default_engine *engine,
+                                            hash_item *it, set_elem_item *elem,
+                                            const void *cookie)
+{
+    set_meta_info *info = (set_meta_info *)item_get_meta(it);
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    int32_t real_mcnt = (info->mcnt == -1 ? max_set_size : info->mcnt);
+#endif
+    ENGINE_ERROR_CODE ret;
+
+#ifdef ENABLE_STICKY_ITEM
+    /* sticky memory limit check */
+    if ((info->mflags & COLL_META_FLAG_STICKY) != 0) {
+        if (engine->stats.sticky_bytes >= engine->config.sticky_limit)
+            return ENGINE_ENOMEM;
+    }
+#endif
+
+    /* overflow check */
+    assert(info->ovflact == OVFL_ERROR);
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    if (info->ccnt >= real_mcnt) {
+        return ENGINE_EOVERFLOW;
+    }
+#else
+    if (info->ccnt >= info->mcnt) {
+        return ENGINE_EOVERFLOW;
+    }
+#endif
+
+    /* create the root hash node if it does not exist */
+    bool new_root_flag = false;
+    if (info->root == NULL) { /* empty set */
+        set_hash_node *r_node = do_set_node_alloc(engine, 0, cookie);
+        if (r_node == NULL) {
+            return ENGINE_ENOMEM;
+        }
+        do_set_node_link(engine, info, NULL, 0, r_node);
+        new_root_flag = true;
+    }
+
+    /* insert the element */
+    ret = do_set_elem_link(engine, info, elem, cookie);
+    if (ret != ENGINE_SUCCESS) {
+        if (new_root_flag) {
+            do_set_node_unlink(engine, info, NULL, 0);
+        }
+    }
+    return ret;
 }
 
 /*
@@ -3657,32 +3838,37 @@ static ENGINE_ERROR_CODE do_btree_elem_update(struct default_engine *engine, btr
 static uint32_t do_btree_elem_delete(struct default_engine *engine, btree_meta_info *info,
                                      const int bkrtype, const bkey_range *bkrange,
                                      const eflag_filter *efilter, const uint32_t count,
-                                     enum elem_delete_cause cause)
+                                     uint32_t *access_count, enum elem_delete_cause cause)
 {
     btree_elem_posi  path[BTREE_MAX_DEPTH];
     btree_elem_item *elem;
-    uint32_t tot_fcnt; /* found count */
+    uint32_t tot_found = 0; /* found count */
+    uint32_t tot_access = 0; /* access count */
 
-    if (info->root == NULL) return 0;
+    if (info->root == NULL) {
+        if (access_count)
+            *access_count = 0;
+        return 0;
+    }
 
     assert(info->root->ndepth < BTREE_MAX_DEPTH);
-    tot_fcnt = 0;
     elem = do_btree_find_first(info->root, bkrtype, bkrange, path, true);
     if (elem != NULL) {
         if (bkrtype == BKEY_RANGE_TYPE_SIN) {
             assert(path[0].bkeq == true);
+            tot_access++;
             if (efilter == NULL || do_btree_elem_filter(elem, efilter)) {
                 /* cause == ELEM_DELETE_NORMAL */
                 do_btree_elem_unlink(engine, info, path, cause);
-                tot_fcnt = 1;
+                tot_found = 1;
             }
         } else {
             btree_elem_posi upth[BTREE_MAX_DEPTH]; /* upper node path */
             btree_elem_posi c_posi = path[0];
             btree_elem_posi s_posi = c_posi;
             size_t stotal = 0;
-            int  cur_fcnt = 0;
-            int  node_cnt = 1;
+            int cur_found = 0;
+            int node_cnt = 1;
             bool forward = (bkrtype == BKEY_RANGE_TYPE_ASC ? true : false);
             int i;
 
@@ -3695,6 +3881,7 @@ static uint32_t do_btree_elem_delete(struct default_engine *engine, btree_meta_i
 
             c_posi.bkeq = false;
             do {
+                tot_access++;
                 if (efilter == NULL || do_btree_elem_filter(elem, efilter)) {
                     stotal += slabs_space_size(engine, do_btree_elem_ntotal(elem));
 
@@ -3706,8 +3893,8 @@ static uint32_t do_btree_elem_delete(struct default_engine *engine, btree_meta_i
                     }
                     c_posi.node->item[c_posi.indx] = NULL;
 
-                    cur_fcnt++;
-                    if (count > 0 && (tot_fcnt+cur_fcnt) >= count) break;
+                    cur_found++;
+                    if (count > 0 && (tot_found+cur_found) >= count) break;
                 }
 
                 if (c_posi.bkeq == true) {
@@ -3718,14 +3905,14 @@ static uint32_t do_btree_elem_delete(struct default_engine *engine, btree_meta_i
                 if (elem == NULL) break;
 
                 if (s_posi.node != c_posi.node) {
-                    if (cur_fcnt > 0) {
-                        do_btree_node_remove_null_items(&s_posi, forward, cur_fcnt);
+                    if (cur_found > 0) {
+                        do_btree_node_remove_null_items(&s_posi, forward, cur_found);
                         /* decrement element count in upper nodes */
                         for (i = 1; i <= info->root->ndepth; i++) {
-                            assert(upth[i].node->ecnt[upth[i].indx] >= cur_fcnt);
-                            upth[i].node->ecnt[upth[i].indx] -= cur_fcnt;
+                            assert(upth[i].node->ecnt[upth[i].indx] >= cur_found);
+                            upth[i].node->ecnt[upth[i].indx] -= cur_found;
                         }
-                        tot_fcnt += cur_fcnt; cur_fcnt = 0;
+                        tot_found += cur_found; cur_found = 0;
                     }
                     if (info->root->ndepth > 0) {
                         /* adjust upper node path */
@@ -3737,17 +3924,17 @@ static uint32_t do_btree_elem_delete(struct default_engine *engine, btree_meta_i
                 }
             } while (elem != NULL);
 
-            if (cur_fcnt > 0) {
-                do_btree_node_remove_null_items(&s_posi, forward, cur_fcnt);
+            if (cur_found > 0) {
+                do_btree_node_remove_null_items(&s_posi, forward, cur_found);
                 /* decrement element count in upper nodes */
                 for (i = 1; i <= info->root->ndepth; i++) {
-                    assert(upth[i].node->ecnt[upth[i].indx] >= cur_fcnt);
-                    upth[i].node->ecnt[upth[i].indx] -= cur_fcnt;
+                    assert(upth[i].node->ecnt[upth[i].indx] >= cur_found);
+                    upth[i].node->ecnt[upth[i].indx] -= cur_found;
                 }
-                tot_fcnt += cur_fcnt;
+                tot_found += cur_found;
             }
-            if (tot_fcnt > 0) {
-                info->ccnt -= tot_fcnt;
+            if (tot_found > 0) {
+                info->ccnt -= tot_found;
                 if (info->stotal > 0) { /* apply memory space */
                     /* The btree has already been unlinked from hash table.
                      * If then, the btree doesn't have prefix info and has stotal of 0.
@@ -3760,7 +3947,9 @@ static uint32_t do_btree_elem_delete(struct default_engine *engine, btree_meta_i
             }
         }
     }
-    return tot_fcnt;
+    if (access_count)
+        *access_count = tot_access;
+    return tot_found;
 }
 
 static inline void get_bkey_full_range(const int bktype, const bool ascend, bkey_range *bkrange)
@@ -3799,6 +3988,9 @@ static ENGINE_ERROR_CODE do_btree_overflow_check(btree_meta_info *info, btree_el
     /* info->ccnt >= 1 */
     btree_elem_item *min_bkey_elem = NULL;
     btree_elem_item *max_bkey_elem = NULL;
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    int32_t real_mcnt = (info->mcnt == -1 ? max_btree_size : info->mcnt);
+#endif
 
     /* step 1: overflow check on max bkey range */
     if (info->maxbkeyrange.len != BKEY_NULL) {
@@ -3836,7 +4028,11 @@ static ENGINE_ERROR_CODE do_btree_overflow_check(btree_meta_info *info, btree_el
     }
 
     /* step 2: overflow check on max element count */
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+    if (info->ccnt >= real_mcnt && *overflow_type == OVFL_TYPE_NONE) {
+#else
     if (info->ccnt >= info->mcnt && *overflow_type == OVFL_TYPE_NONE) {
+#endif
         if (info->ovflact == OVFL_ERROR) {
             return ENGINE_EOVERFLOW;
         }
@@ -3910,14 +4106,13 @@ static void do_btree_overflow_trim(struct default_engine *engine, btree_meta_inf
         }
         bkrtype = do_btree_bkey_range_type(&bkrange_space);
         del_count = do_btree_elem_delete(engine, info, bkrtype, &bkrange_space, NULL, 0,
-                                         ELEM_DELETE_TRIM);
+                                         NULL, ELEM_DELETE_TRIM);
         assert(del_count > 0);
         assert(info->ccnt > 0);
         if (info->ovflact == OVFL_SMALLEST_TRIM || info->ovflact == OVFL_LARGEST_TRIM)
             info->mflags &= ~COLL_META_FLAG_TRIMMED; // clear trimmed
     } else { /* overflow_type == OVFL_TYPE_COUNT */
         assert(overflow_type == OVFL_TYPE_COUNT);
-        assert((info->ccnt-1) == info->mcnt);
 
         btree_elem_posi delpath[BTREE_MAX_DEPTH];
         assert(info->root->ndepth < BTREE_MAX_DEPTH);
@@ -4048,26 +4243,32 @@ static bool do_btree_overlapped_with_trimmed_space(btree_meta_info *info,
 static uint32_t do_btree_elem_get(struct default_engine *engine, btree_meta_info *info,
                                   const int bkrtype, const bkey_range *bkrange, const eflag_filter *efilter,
                                   const uint32_t offset, const uint32_t count, const bool delete,
-                                  btree_elem_item **elem_array, bool *potentialbkeytrim)
+                                  btree_elem_item **elem_array,
+                                  uint32_t *access_count, bool *potentialbkeytrim)
 {
     btree_elem_posi  path[BTREE_MAX_DEPTH];
     btree_elem_item *elem;
-    uint32_t tot_fcnt; /* total found count */
+    uint32_t tot_found = 0; /* total found count */
+    uint32_t tot_access = 0; /* total access count */
 
     *potentialbkeytrim = false;
 
-    if (info->root == NULL) return 0;
+    if (info->root == NULL) {
+        if (access_count)
+            *access_count = 0;
+        return 0;
+    }
 
     assert(info->root->ndepth < BTREE_MAX_DEPTH);
-    tot_fcnt = 0;
     elem = do_btree_find_first(info->root, bkrtype, bkrange, path, delete);
     if (elem != NULL) {
         if (bkrtype == BKEY_RANGE_TYPE_SIN) { /* single bkey */
             assert(path[0].bkeq == true);
+            tot_access++;
             if (offset == 0) {
                 if (efilter == NULL || do_btree_elem_filter(elem, efilter)) {
                     elem->refcount++;
-                    elem_array[tot_fcnt++] = elem;
+                    elem_array[tot_found++] = elem;
                     if (delete) {
                         do_btree_elem_unlink(engine, info, path, ELEM_DELETE_NORMAL);
                     }
@@ -4078,9 +4279,9 @@ static uint32_t do_btree_elem_get(struct default_engine *engine, btree_meta_info
             btree_elem_posi c_posi = path[0];
             btree_elem_posi s_posi = c_posi;
             size_t stotal = 0;
-            int  cur_fcnt = 0;
-            int  skip_cnt = 0;
-            int  node_cnt = 1;
+            int cur_found = 0;
+            int skip_cnt = 0;
+            int node_cnt = 1;
             bool forward = (bkrtype == BKEY_RANGE_TYPE_ASC ? true : false);
             int i;
 
@@ -4102,19 +4303,20 @@ static uint32_t do_btree_elem_get(struct default_engine *engine, btree_meta_info
 
             c_posi.bkeq = false;
             do {
+                tot_access++;
                 if (efilter == NULL || do_btree_elem_filter(elem, efilter)) {
                     if (skip_cnt < offset) {
                         skip_cnt++;
                     } else {
                         elem->refcount++;
-                        elem_array[tot_fcnt+cur_fcnt] = elem;
+                        elem_array[tot_found+cur_found] = elem;
                         if (delete) {
                             stotal += slabs_space_size(engine, do_btree_elem_ntotal(elem));
                             elem->status = BTREE_ITEM_STATUS_UNLINK;
                             c_posi.node->item[c_posi.indx] = NULL;
                         }
-                        cur_fcnt++;
-                        if (count > 0 && (tot_fcnt+cur_fcnt) >= count) break;
+                        cur_found++;
+                        if (count > 0 && (tot_found+cur_found) >= count) break;
                     }
                 }
 
@@ -4126,16 +4328,16 @@ static uint32_t do_btree_elem_get(struct default_engine *engine, btree_meta_info
                 if (elem == NULL) break;
 
                 if (s_posi.node != c_posi.node) {
-                    if (cur_fcnt > 0) {
+                    if (cur_found > 0) {
                         if (delete) {
-                            do_btree_node_remove_null_items(&s_posi, forward, cur_fcnt);
+                            do_btree_node_remove_null_items(&s_posi, forward, cur_found);
                             /* decrement element count in upper nodes */
                             for (i = 1; i <= info->root->ndepth; i++) {
-                                assert(upth[i].node->ecnt[upth[i].indx] >= cur_fcnt);
-                                upth[i].node->ecnt[upth[i].indx] -= cur_fcnt;
+                                assert(upth[i].node->ecnt[upth[i].indx] >= cur_found);
+                                upth[i].node->ecnt[upth[i].indx] -= cur_found;
                             }
                         }
-                        tot_fcnt += cur_fcnt; cur_fcnt = 0;
+                        tot_found += cur_found; cur_found = 0;
                     }
                     if (delete) {
                         if (info->root->ndepth > 0) {
@@ -4158,19 +4360,19 @@ static uint32_t do_btree_elem_get(struct default_engine *engine, btree_meta_info
                 }
             }
 
-            if (cur_fcnt > 0) {
+            if (cur_found > 0) {
                 if (delete) {
-                    do_btree_node_remove_null_items(&s_posi, forward, cur_fcnt);
+                    do_btree_node_remove_null_items(&s_posi, forward, cur_found);
                     /* decrement element count in upper nodes */
                     for (i = 1; i <= info->root->ndepth; i++) {
-                        assert(upth[i].node->ecnt[upth[i].indx] >= cur_fcnt);
-                        upth[i].node->ecnt[upth[i].indx] -= cur_fcnt;
+                        assert(upth[i].node->ecnt[upth[i].indx] >= cur_found);
+                        upth[i].node->ecnt[upth[i].indx] -= cur_found;
                     }
                 }
-                tot_fcnt += cur_fcnt;
+                tot_found += cur_found;
             }
-            if (tot_fcnt > 0 && delete) { /* apply memory space */
-                info->ccnt -= tot_fcnt;
+            if (tot_found > 0 && delete) { /* apply memory space */
+                info->ccnt -= tot_found;
                 assert(stotal > 0 && stotal <= info->stotal);
                 decrease_collection_space(engine, ITEM_TYPE_BTREE, (coll_meta_info *)info, stotal);
                 do_btree_node_merge(engine, info, path, forward, node_cnt);
@@ -4183,32 +4385,40 @@ static uint32_t do_btree_elem_get(struct default_engine *engine, btree_meta_info
             }
         }
     }
-    return tot_fcnt;
+    if (access_count)
+        *access_count = tot_access;
+    return tot_found;
 }
 
 static uint32_t do_btree_elem_count(struct default_engine *engine, btree_meta_info *info,
                                     const int bkrtype, const bkey_range *bkrange,
-                                    const eflag_filter *efilter)
+                                    const eflag_filter *efilter, uint32_t *access_count)
 {
     btree_elem_posi  posi;
     btree_elem_item *elem;
-    uint32_t tot_fcnt; /* total found count */
+    uint32_t tot_found = 0; /* total found count */
+    uint32_t tot_access = 0; /* total access count */
 
-    if (info->root == NULL) return 0;
+    if (info->root == NULL) {
+        if (access_count)
+            *access_count = 0;
+        return 0;
+    }
 
-    tot_fcnt = 0;
     elem = do_btree_find_first(info->root, bkrtype, bkrange, &posi, false);
     if (elem != NULL) {
         if (bkrtype == BKEY_RANGE_TYPE_SIN) {
             assert(posi.bkeq == true);
+            tot_access++;
             if (efilter == NULL || do_btree_elem_filter(elem, efilter))
-                tot_fcnt++;
+                tot_found++;
         } else { /* BKEY_RANGE_TYPE_ASC || BKEY_RANGE_TYPE_DSC */
             bool forward = (bkrtype == BKEY_RANGE_TYPE_ASC ? true : false);
             posi.bkeq = false;
             do {
+                tot_access++;
                 if (efilter == NULL || do_btree_elem_filter(elem, efilter))
-                    tot_fcnt++;
+                    tot_found++;
 
                 if (posi.bkeq == true) {
                     elem = NULL; break;
@@ -4218,7 +4428,52 @@ static uint32_t do_btree_elem_count(struct default_engine *engine, btree_meta_in
             } while (elem != NULL);
         }
     }
-    return tot_fcnt;
+    if (access_count)
+        *access_count = tot_access;
+    return tot_found;
+}
+
+static ENGINE_ERROR_CODE do_btree_elem_insert(struct default_engine *engine,
+                                              hash_item *it, btree_elem_item *elem,
+                                              const bool replace_if_exist, bool *replaced,
+                                              btree_elem_item **trimmed_elems,
+                                              uint32_t *trimmed_count, const void *cookie)
+{
+    btree_meta_info *info = (btree_meta_info *)item_get_meta(it);
+    ENGINE_ERROR_CODE ret;
+
+    /* validation check: bkey type */
+    if (info->ccnt > 0 || info->maxbkeyrange.len != BKEY_NULL) {
+        if ((info->bktype == BKEY_TYPE_UINT64 && elem->nbkey >  0) ||
+            (info->bktype == BKEY_TYPE_BINARY && elem->nbkey == 0)) {
+            return ENGINE_EBADBKEY;
+        }
+    }
+
+    /* Both sticky memory limit check and overflow check
+     * are to be performed in the below do_btree_elem_link().
+     */
+
+    /* create the root node if it does not exist */
+    bool new_root_flag = false;
+    if (info->root == NULL) {
+        btree_indx_node *r_node = do_btree_node_alloc(engine, 0, cookie);
+        if (r_node == NULL) {
+            return ENGINE_ENOMEM;
+        }
+        do_btree_node_link(engine, info, r_node, NULL);
+        new_root_flag = true;
+    }
+
+    /* insert the element */
+    ret = do_btree_elem_link(engine, info, elem, replace_if_exist, replaced,
+                             trimmed_elems, trimmed_count, cookie);
+    if (ret != ENGINE_SUCCESS) {
+        if (new_root_flag) {
+            do_btree_node_unlink(engine, info, info->root, NULL);
+        }
+    }
+    return ret;
 }
 
 static ENGINE_ERROR_CODE do_btree_elem_arithmetic(struct default_engine *engine, btree_meta_info *info,
@@ -4443,6 +4698,7 @@ static uint32_t do_btree_elem_get_by_posi(btree_meta_info *info,
     return nfound;
 }
 
+#ifdef SUPPORT_BOP_SMGET
 static inline int do_btree_comp_hkey(hash_item *it1, hash_item *it2)
 {
     int cmp_res;
@@ -4460,8 +4716,166 @@ static inline int do_btree_comp_hkey(hash_item *it1, hash_item *it2)
     return cmp_res;
 }
 
-#ifdef SUPPORT_BOP_SMGET
-static ENGINE_ERROR_CODE do_btree_smget_scan_sort(struct default_engine *engine,
+/*** NOT USED CODE ***
+static inline int do_comp_key_string(const char *key1, const int len1,
+                                     const char *key2, const int len2)
+{
+    int res;
+    if (len1 == len2) {
+        retrun strncmp(key1, key2, len1);
+    }
+    if (len1 < len2) {
+        res = strncmp(key1, key2, len1);
+        if (res == 0) res = -1;
+    } else {
+        res = strncmp(key1, key2, len2);
+        if (res == 0) res =  1;
+    }
+    return res;
+}
+**********************/
+
+static btree_elem_item *do_btree_scan_next(btree_elem_posi *posi,
+                             const int bkrtype, const bkey_range *bkrange)
+{
+    if (posi->bkeq == true)
+        return NULL;
+
+    if (bkrtype != BKEY_RANGE_TYPE_DSC) // ascending
+        return do_btree_find_next(posi, bkrange);
+    else // descending
+        return do_btree_find_prev(posi, bkrange);
+}
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+static void do_btree_smget_add_miss(smget_result_t *smres,
+                                    uint16_t kidx, uint16_t erid)
+{
+    /* miss_kinfo: forward array */
+    smres->miss_kinfo[smres->miss_count].kidx = kidx;
+    smres->miss_kinfo[smres->miss_count].code = erid; /* error id */
+    smres->miss_count++;
+}
+
+static void do_btree_smget_add_trim(smget_result_t *smres,
+                                    uint16_t kidx, btree_elem_item *elem)
+{
+    /* trim_elems & trim_kinfo: backward array */
+    assert(smres->trim_count < smres->keys_arrsz);
+    smres->trim_elems[smres->keys_arrsz-1-smres->trim_count] = elem;
+    smres->trim_kinfo[smres->keys_arrsz-1-smres->trim_count].kidx = kidx;
+    //smres->trim_kinfo[smres->keys_arrsz-1-smres->trim_count].code = 0;
+    smres->trim_count++;
+}
+
+#if 1 // JHPARK_SMGET_OFFSET_HANDLING
+#else
+static bool do_btree_smget_check_trim(smget_result_t *smres)
+{
+    btree_elem_item *head_elem = smres->elem_array[0];
+    btree_elem_item *trim_elem;
+    bool valid = true;
+
+    /* Check if all the trimmed elements(actually the last element before trim)
+     * are behind the first found element of smget.
+     */
+    if (smres->ascending) {
+        for (int i = 0; i < smres->trim_count; i++) {
+            trim_elem = smres->trim_elems[smres->keys_arrsz-1-i];
+            if (BKEY_COMP(trim_elem->data, trim_elem->nbkey,
+                          head_elem->data, head_elem->nbkey) < 0) {
+                valid = false; break;
+            }
+        }
+    } else {
+        for (int i = 0; i < smres->trim_count; i++) {
+            trim_elem = smres->trim_elems[smres->keys_arrsz-1-i];
+            if (BKEY_COMP(trim_elem->data, trim_elem->nbkey,
+                          head_elem->data, head_elem->nbkey) > 0) {
+                valid = false; break;
+            }
+        }
+    }
+    return valid;
+}
+#endif
+
+static void do_btree_smget_adjust_trim(smget_result_t *smres)
+{
+    eitem       **new_trim_elems = &smres->elem_array[smres->elem_count];
+    smget_emis_t *new_trim_kinfo = &smres->miss_kinfo[smres->miss_count];
+    uint32_t      new_trim_count = 0;
+    btree_elem_item *tail_elem = NULL;
+    btree_elem_item *comp_elem;
+    btree_elem_item *trim_elem;
+    uint16_t         trim_kidx;
+    int idx, res, pos, i;
+    int left, right, mid;
+
+    if (smres->elem_count == smres->elem_arrsz) {
+        /* We found the elements as many as the requested count. In this case,
+         * we might trim the trimmed keys if the bkey-before-trim is behind
+         * the bkey of the last found element.
+         */
+        tail_elem = smres->elem_array[smres->elem_count-1];
+    }
+
+    for (idx = smres->trim_count-1; idx >= 0; idx--)
+    {
+        trim_elem = smres->trim_elems[smres->keys_arrsz-1-idx];
+        trim_kidx = smres->trim_kinfo[smres->keys_arrsz-1-idx].kidx;
+        /* check if the trim elem is valid */
+        if (tail_elem != NULL) {
+            res = BKEY_COMP(trim_elem->data, trim_elem->nbkey,
+                            tail_elem->data, tail_elem->nbkey);
+            if ((smres->ascending == true && res > 0) ||
+                (smres->ascending != true && res < 0)) {
+                continue; /* invalid trim */
+            }
+        }
+        /* add the valid trim info in sorted arry */
+        if (new_trim_count == 0) {
+            pos = 0;
+        } else {
+            left  = 0;
+            right = new_trim_count-1;
+            while (left <= right) {
+                mid = (left + right) / 2;
+                comp_elem = new_trim_elems[mid];
+                res = BKEY_COMP(trim_elem->data, trim_elem->nbkey,
+                                comp_elem->data, comp_elem->nbkey);
+                if (res == 0) {
+                    right = mid; left = mid+1;
+                    break;
+                }
+                if (smres->ascending) {
+                    if (res < 0) right = mid-1;
+                    else         left  = mid+1;
+                } else {
+                    if (res > 0) right = mid-1;
+                    else         left  = mid+1;
+                }
+            }
+            /* left: insertion position */
+            for (i = new_trim_count-1; i >= left; i--) {
+                new_trim_elems[i+1] = new_trim_elems[i];
+                new_trim_kinfo[i+1] = new_trim_kinfo[i];
+            }
+            pos = left;
+        }
+        trim_elem->refcount++;
+        new_trim_elems[pos] = trim_elem;
+        new_trim_kinfo[pos].kidx = trim_kidx;
+        new_trim_count++;
+    }
+    smres->trim_elems = new_trim_elems;
+    smres->trim_kinfo = new_trim_kinfo;
+    smres->trim_count = new_trim_count;
+}
+#endif
+
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+static ENGINE_ERROR_CODE do_btree_smget_scan_sort_old(struct default_engine *engine,
                                     token_t *key_array, const int key_count,
                                     const int bkrtype, const bkey_range *bkrange,
                                     const eflag_filter *efilter, const uint32_t req_count,
@@ -4482,6 +4896,7 @@ static ENGINE_ERROR_CODE do_btree_smget_scan_sort(struct default_engine *engine,
     int k, i, cmp_res;
     int mid, left, right;
     bool ascending = (bkrtype != BKEY_RANGE_TYPE_DSC ? true : false);
+    bool is_first;
     bkey_t   maxbkeyrange;
     int32_t  maxelemcount = 0;
     uint8_t  overflowactn = OVFL_SMALLEST_TRIM;
@@ -4516,6 +4931,23 @@ static ENGINE_ERROR_CODE do_btree_smget_scan_sort(struct default_engine *engine,
         }
         assert(info->root != NULL);
 
+        if (sort_count == 0) {
+            /* save the b+tree attributes */
+            maxbkeyrange = info->maxbkeyrange;
+            maxelemcount = info->mcnt;
+            overflowactn = info->ovflact;
+        } else {
+            /* check if the b+trees have same attributes */
+            if (maxelemcount != info->mcnt || overflowactn != info->ovflact ||
+                maxbkeyrange.len != info->maxbkeyrange.len ||
+                (maxbkeyrange.len != BKEY_NULL &&
+                 BKEY_ISNE(maxbkeyrange.val, maxbkeyrange.len, info->maxbkeyrange.val, maxbkeyrange.len)))
+            {
+                do_item_release(engine, it);
+                ret = ENGINE_EBADATTR; break;
+            }
+        }
+
         elem = do_btree_find_first(info->root, bkrtype, bkrange, &posi, false);
         if (elem == NULL) { /* No elements within the bkey range */
             if ((info->mflags & COLL_META_FLAG_TRIMMED) != 0) {
@@ -4537,44 +4969,29 @@ static ENGINE_ERROR_CODE do_btree_smget_scan_sort(struct default_engine *engine,
             }
         }
 
+        /* initialize for the next scan */
+        is_first = true;
         posi.bkeq = false;
-        do {
-           if (efilter == NULL || do_btree_elem_filter(elem, efilter))
-               break;
 
-           if (posi.bkeq == true) {
-               elem = NULL; break;
-           }
-           elem = (ascending ? do_btree_find_next(&posi, bkrange)
-                             : do_btree_find_prev(&posi, bkrange));
-        } while (elem != NULL);
-
-        if (elem == NULL) {
-            if (posi.node == NULL && (info->mflags & COLL_META_FLAG_TRIMMED) != 0) {
-                if (do_btree_overlapped_with_trimmed_space(info, &posi, bkrtype)) {
-                    do_item_release(engine, it);
-                    ret = ENGINE_EBKEYOOR; break;
+scan_next:
+        if (is_first != true) {
+            assert(elem != NULL);
+            elem = do_btree_scan_next(&posi, bkrtype, bkrange);
+            if (elem == NULL) {
+                if (posi.node == NULL && (info->mflags & COLL_META_FLAG_TRIMMED) != 0) {
+                    if (do_btree_overlapped_with_trimmed_space(info, &posi, bkrtype)) {
+                        do_item_release(engine, it);
+                        ret = ENGINE_EBKEYOOR; break;
+                    }
                 }
-            }
-            do_item_release(engine, it);
-            continue;
-        }
-
-        if (sort_count == 0) {
-            /* save the b+tree attributes */
-            maxbkeyrange = info->maxbkeyrange;
-            maxelemcount = info->mcnt;
-            overflowactn = info->ovflact;
-        } else {
-            /* check if the b+trees have same attributes */
-            if (maxelemcount != info->mcnt || overflowactn != info->ovflact ||
-                maxbkeyrange.len != info->maxbkeyrange.len ||
-                (maxbkeyrange.len != BKEY_NULL &&
-                 BKEY_ISNE(maxbkeyrange.val, maxbkeyrange.len, info->maxbkeyrange.val, maxbkeyrange.len)))
-            {
                 do_item_release(engine, it);
-                ret = ENGINE_EBADATTR; break;
+                continue;
             }
+        }
+        is_first = false;
+
+        if (efilter != NULL && !do_btree_elem_filter(elem, efilter)) {
+            goto scan_next;
         }
 
         /* found the item */
@@ -4583,8 +5000,12 @@ static ENGINE_ERROR_CODE do_btree_smget_scan_sort(struct default_engine *engine,
         btree_scan_buf[curr_idx].kidx = k;
 
         /* add the current scan into the scan sort buffer */
+        if (sort_count == 0) {
+            sort_sindx_buf[sort_count++] = curr_idx;
+            curr_idx += 1;
+            continue;
+        }
 
-        /* insert the index into the sort_sindx_buf */
         if (sort_count >= req_count) {
             /* compare with the element of the last scan */
             comp_idx = sort_sindx_buf[sort_count-1];
@@ -4608,53 +5029,352 @@ static ENGINE_ERROR_CODE do_btree_smget_scan_sort(struct default_engine *engine,
                 btree_scan_buf[curr_idx].it = NULL;
                 continue;
             }
+        }
+
+        left = 0;
+        right = sort_count-1;
+        while (left <= right) {
+            mid  = (left + right) / 2;
+            comp_idx = sort_sindx_buf[mid];
+            comp = BTREE_GET_ELEM_ITEM(btree_scan_buf[comp_idx].posi.node,
+                                       btree_scan_buf[comp_idx].posi.indx);
+            cmp_res = BKEY_COMP(elem->data, elem->nbkey, comp->data, comp->nbkey);
+            if (cmp_res == 0) {
+                cmp_res = do_btree_comp_hkey(btree_scan_buf[curr_idx].it,
+                                             btree_scan_buf[comp_idx].it);
+                if (cmp_res == 0) {
+                    ret = ENGINE_EBADVALUE; break;
+                }
+                *bkey_duplicated = true;
+            }
+            if (ascending) {
+                if (cmp_res < 0) right = mid-1;
+                else             left  = mid+1;
+            } else {
+                if (cmp_res > 0) right = mid-1;
+                else             left  = mid+1;
+            }
+        }
+        if (ret == ENGINE_EBADVALUE) {
+            do_item_release(engine, btree_scan_buf[curr_idx].it);
+            btree_scan_buf[curr_idx].it = NULL;
+            break;
+        }
+
+        if (sort_count >= req_count) {
             /* free the last scan */
+            comp_idx = sort_sindx_buf[sort_count-1];
             do_item_release(engine, btree_scan_buf[comp_idx].it);
             btree_scan_buf[comp_idx].it = NULL;
             free_idx = comp_idx;
             sort_count--;
         }
+        for (i = sort_count-1; i >= left; i--) {
+            sort_sindx_buf[i+1] = sort_sindx_buf[i];
+        }
+        sort_sindx_buf[left] = curr_idx;
+        sort_count++;
 
-        /* sort_count < req_count */
+        if (sort_count < req_count) {
+            curr_idx += 1;
+        } else {
+            curr_idx = free_idx;
+        }
+    }
+
+    if (ret == ENGINE_SUCCESS) {
+        *sort_sindx_cnt = sort_count;
+    } else {
+        for (i = 0; i < sort_count; i++) {
+            curr_idx = sort_sindx_buf[i];
+            do_item_release(engine, btree_scan_buf[curr_idx].it);
+            btree_scan_buf[curr_idx].it = NULL;
+        }
+    }
+    return ret;
+}
+#endif
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+static ENGINE_ERROR_CODE
+do_btree_smget_scan_sort(struct default_engine *engine,
+                         token_t *key_array, const int key_count,
+                         const int bkrtype, const bkey_range *bkrange,
+                         const eflag_filter *efilter, const uint32_t req_count,
+                         const bool unique,
+                         btree_scan_info *btree_scan_buf,
+                         uint16_t *sort_sindx_buf, uint32_t *sort_sindx_cnt,
+                         smget_result_t *smres)
+#else
+static ENGINE_ERROR_CODE do_btree_smget_scan_sort(struct default_engine *engine,
+                                    token_t *key_array, const int key_count,
+                                    const int bkrtype, const bkey_range *bkrange,
+                                    const eflag_filter *efilter, const uint32_t req_count,
+                                    btree_scan_info *btree_scan_buf,
+                                    uint16_t *sort_sindx_buf, uint32_t *sort_sindx_cnt,
+                                    uint32_t *missed_key_array, uint32_t *missed_key_count,
+                                    bool *bkey_duplicated)
+#endif
+{
+    ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
+    hash_item *it;
+    btree_meta_info *info;
+    btree_elem_item *elem, *comp;
+    btree_elem_posi posi;
+    uint16_t comp_idx;
+    uint16_t curr_idx = 0;
+    uint16_t free_idx = req_count;
+    int sort_count = 0; /* sorted scan count */
+    int k, i, cmp_res;
+    int mid, left, right;
+    bool ascending = (bkrtype != BKEY_RANGE_TYPE_DSC ? true : false);
+    bool is_first;
+    bkey_t   maxbkeyrange;
+    int32_t  maxelemcount = 0;
+    uint8_t  overflowactn = OVFL_SMALLEST_TRIM;
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#else
+    *missed_key_count = 0;
+#endif
+
+    maxbkeyrange.len = BKEY_NULL;
+    for (k = 0; k < key_count; k++) {
+        ret = do_btree_item_find(engine, key_array[k].value, key_array[k].length, true, &it);
+        if (ret != ENGINE_SUCCESS) {
+            if (ret == ENGINE_KEY_ENOENT) { /* key missed */
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+                do_btree_smget_add_miss(smres, k, ENGINE_KEY_ENOENT);
+#else
+                missed_key_array[*missed_key_count] = k;
+                *missed_key_count += 1;
+#endif
+                ret = ENGINE_SUCCESS; continue;
+            }
+            break; /* ret == ENGINE_EBADTYPE */
+        }
+
+        info = (btree_meta_info *)item_get_meta(it);
+        if ((info->mflags & COLL_META_FLAG_READABLE) == 0) { /* unreadable collection */
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            do_btree_smget_add_miss(smres, k, ENGINE_UNREADABLE);
+#else
+            missed_key_array[*missed_key_count] = k;
+            *missed_key_count += 1;
+#endif
+            do_item_release(engine, it); continue;
+        }
+        if (info->ccnt == 0) { /* empty collection */
+            do_item_release(engine, it); continue;
+        }
+        if ((info->bktype == BKEY_TYPE_UINT64 && bkrange->from_nbkey >  0) ||
+            (info->bktype == BKEY_TYPE_BINARY && bkrange->from_nbkey == 0)) {
+            do_item_release(engine, it);
+            ret = ENGINE_EBADBKEY; break;
+        }
+        assert(info->root != NULL);
+
+        if (sort_count == 0) {
+            /* save the b+tree attributes */
+            maxbkeyrange = info->maxbkeyrange;
+            maxelemcount = info->mcnt;
+            overflowactn = info->ovflact;
+        } else {
+            /* check if the b+trees have same attributes */
+            if (maxelemcount != info->mcnt || overflowactn != info->ovflact ||
+                maxbkeyrange.len != info->maxbkeyrange.len ||
+                (maxbkeyrange.len != BKEY_NULL &&
+                 BKEY_ISNE(maxbkeyrange.val, maxbkeyrange.len, info->maxbkeyrange.val, maxbkeyrange.len)))
+            {
+                do_item_release(engine, it);
+                ret = ENGINE_EBADATTR; break;
+            }
+        }
+
+        elem = do_btree_find_first(info->root, bkrtype, bkrange, &posi, false);
+        if (elem == NULL) { /* No elements within the bkey range */
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            if ((info->mflags & COLL_META_FLAG_TRIMMED) != 0 &&
+                do_btree_overlapped_with_trimmed_space(info, &posi, bkrtype)) {
+                /* Some elements weren't cached because of overflow trim */
+                do_btree_smget_add_miss(smres, k, ENGINE_EBKEYOOR);
+            }
+            do_item_release(engine, it); continue;
+#else
+            if ((info->mflags & COLL_META_FLAG_TRIMMED) != 0) {
+                /* Some elements weren't cached because of overflow trim */
+                if (do_btree_overlapped_with_trimmed_space(info, &posi, bkrtype)) {
+                    do_item_release(engine, it);
+                    ret = ENGINE_EBKEYOOR; break;
+                }
+            }
+            do_item_release(engine, it);
+            continue;
+#endif
+        }
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        if (posi.bkeq == false && (info->mflags & COLL_META_FLAG_TRIMMED) != 0 &&
+            do_btree_overlapped_with_trimmed_space(info, &posi, bkrtype)) {
+            /* Some elements weren't cached because of overflow trim */
+            do_btree_smget_add_miss(smres, k, ENGINE_EBKEYOOR);
+            do_item_release(engine, it); continue;
+        }
+#else
+        if (posi.bkeq == false && (info->mflags & COLL_META_FLAG_TRIMMED) != 0) {
+            /* Some elements weren't cached because of overflow trim */
+            if (do_btree_overlapped_with_trimmed_space(info, &posi, bkrtype)) {
+                do_item_release(engine, it);
+                ret = ENGINE_EBKEYOOR; break;
+            }
+        }
+#endif
+
+        /* initialize for the next scan */
+        is_first = true;
+        posi.bkeq = false;
+
+scan_next:
+        if (is_first != true) {
+            assert(elem != NULL);
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            btree_elem_item *prev = elem;
+            elem = do_btree_scan_next(&posi, bkrtype, bkrange);
+            if (elem == NULL) {
+                if (posi.node == NULL && (info->mflags & COLL_META_FLAG_TRIMMED) != 0 &&
+                    do_btree_overlapped_with_trimmed_space(info, &posi, bkrtype)) {
+                    /* Some elements weren't cached because of overflow trim */
+                    do_btree_smget_add_trim(smres, k, prev);
+                }
+                do_item_release(engine, it); continue;
+            }
+#else
+            elem = do_btree_scan_next(&posi, bkrtype, bkrange);
+            if (elem == NULL) {
+                if (posi.node == NULL && (info->mflags & COLL_META_FLAG_TRIMMED) != 0) {
+                    if (do_btree_overlapped_with_trimmed_space(info, &posi, bkrtype)) {
+                        do_item_release(engine, it);
+                        ret = ENGINE_EBKEYOOR; break;
+                    }
+                }
+                do_item_release(engine, it);
+                continue;
+            }
+#endif
+        }
+        is_first = false;
+
+        if (efilter != NULL && !do_btree_elem_filter(elem, efilter)) {
+            goto scan_next;
+        }
+
+        /* found the item */
+        btree_scan_buf[curr_idx].it   = it;
+        btree_scan_buf[curr_idx].posi = posi;
+        btree_scan_buf[curr_idx].kidx = k;
+
+        /* add the current scan into the scan sort buffer */
         if (sort_count == 0) {
             sort_sindx_buf[sort_count++] = curr_idx;
-        } else {
-            left = 0;
-            right = sort_count-1;
-            while (left <= right) {
-                mid  = (left + right) / 2;
-                comp_idx = sort_sindx_buf[mid];
-                comp = BTREE_GET_ELEM_ITEM(btree_scan_buf[comp_idx].posi.node,
-                                           btree_scan_buf[comp_idx].posi.indx);
-                cmp_res = BKEY_COMP(elem->data, elem->nbkey, comp->data, comp->nbkey);
-                if (cmp_res == 0) {
-                    cmp_res = do_btree_comp_hkey(btree_scan_buf[curr_idx].it,
-                                                 btree_scan_buf[comp_idx].it);
-                    if (cmp_res == 0) {
-                        do_item_release(engine, btree_scan_buf[curr_idx].it);
-                        btree_scan_buf[curr_idx].it = NULL;
-                        ret = ENGINE_EBADVALUE; break;
-                    }
-                    *bkey_duplicated = true;
-                }
-                if (ascending) {
-                    if (cmp_res < 0) right = mid-1;
-                    else             left  = mid+1;
-                } else {
-                    if (cmp_res > 0) right = mid-1;
-                    else             left  = mid+1;
-                }
-            }
-            if (ret == ENGINE_EBADVALUE) break;
-
-            assert(left > right);
-            /* left : insert position */
-            for (i = sort_count-1; i >= left; i--) {
-                sort_sindx_buf[i+1] = sort_sindx_buf[i];
-            }
-            sort_sindx_buf[left] = curr_idx;
-            sort_count++;
+            curr_idx += 1;
+            continue;
         }
+
+        if (sort_count >= req_count) {
+            /* compare with the element of the last scan */
+            comp_idx = sort_sindx_buf[sort_count-1];
+            comp = BTREE_GET_ELEM_ITEM(btree_scan_buf[comp_idx].posi.node,
+                                       btree_scan_buf[comp_idx].posi.indx);
+            cmp_res = BKEY_COMP(elem->data, elem->nbkey, comp->data, comp->nbkey);
+            if (cmp_res == 0) {
+                cmp_res = do_btree_comp_hkey(btree_scan_buf[curr_idx].it,
+                                             btree_scan_buf[comp_idx].it);
+                if (cmp_res == 0) {
+                    do_item_release(engine, btree_scan_buf[curr_idx].it);
+                    btree_scan_buf[curr_idx].it = NULL;
+                    ret = ENGINE_EBADVALUE; break;
+                }
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+                smres->duplicated = true;
+                if (unique) {
+                    cmp_res = 0;
+                }
+#else
+                *bkey_duplicated = true;
+#endif
+            }
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            if ((cmp_res == 0) ||
+                (ascending ==  true && cmp_res > 0) ||
+                (ascending == false && cmp_res < 0))
+#else
+            if ((ascending ==  true && cmp_res > 0) ||
+                (ascending == false && cmp_res < 0))
+#endif
+            {
+                /* do not need to proceed the current scan */
+                do_item_release(engine, btree_scan_buf[curr_idx].it);
+                btree_scan_buf[curr_idx].it = NULL;
+                continue;
+            }
+        }
+
+        left = 0;
+        right = sort_count-1;
+        while (left <= right) {
+            mid  = (left + right) / 2;
+            comp_idx = sort_sindx_buf[mid];
+            comp = BTREE_GET_ELEM_ITEM(btree_scan_buf[comp_idx].posi.node,
+                                       btree_scan_buf[comp_idx].posi.indx);
+            cmp_res = BKEY_COMP(elem->data, elem->nbkey, comp->data, comp->nbkey);
+            if (cmp_res == 0) {
+                cmp_res = do_btree_comp_hkey(btree_scan_buf[curr_idx].it,
+                                             btree_scan_buf[comp_idx].it);
+                if (cmp_res == 0) {
+                    ret = ENGINE_EBADVALUE; break;
+                }
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+                smres->duplicated = true;
+                if (unique) {
+                    ret = ENGINE_EDUPLICATE; break;
+                }
+#else
+                *bkey_duplicated = true;
+#endif
+            }
+            if (ascending) {
+                if (cmp_res < 0) right = mid-1;
+                else             left  = mid+1;
+            } else {
+                if (cmp_res > 0) right = mid-1;
+                else             left  = mid+1;
+            }
+        }
+        if (ret == ENGINE_EBADVALUE) {
+            do_item_release(engine, btree_scan_buf[curr_idx].it);
+            btree_scan_buf[curr_idx].it = NULL;
+            break;
+        }
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        if (ret == ENGINE_EDUPLICATE) {
+            ret = ENGINE_SUCCESS;
+            goto scan_next;
+        }
+#endif
+
+        if (sort_count >= req_count) {
+            /* free the last scan */
+            comp_idx = sort_sindx_buf[sort_count-1];
+            do_item_release(engine, btree_scan_buf[comp_idx].it);
+            btree_scan_buf[comp_idx].it = NULL;
+            free_idx = comp_idx;
+            sort_count--;
+        }
+        for (i = sort_count-1; i >= left; i--) {
+            sort_sindx_buf[i+1] = sort_sindx_buf[i];
+        }
+        sort_sindx_buf[left] = curr_idx;
+        sort_count++;
 
         if (sort_count < req_count) {
             curr_idx += 1;
@@ -4677,7 +5397,8 @@ static ENGINE_ERROR_CODE do_btree_smget_scan_sort(struct default_engine *engine,
 #endif
 
 #ifdef SUPPORT_BOP_SMGET
-static int do_btree_smget_elem_sort(btree_scan_info *btree_scan_buf,
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+static int do_btree_smget_elem_sort_old(btree_scan_info *btree_scan_buf,
                                     uint16_t *sort_sindx_buf, const int sort_sindx_cnt,
                                     const int bkrtype, const bkey_range *bkrange, const eflag_filter *efilter,
                                     const uint32_t offset, const uint32_t count,
@@ -4711,18 +5432,8 @@ static int do_btree_smget_elem_sort(btree_scan_info *btree_scan_buf,
             if (elem_count >= count) break;
         }
 
-        do {
-            if (btree_scan_buf[curr_idx].posi.bkeq == true) {
-                elem = NULL; break;
-            }
-            elem = (ascending ? do_btree_find_next(&btree_scan_buf[curr_idx].posi, bkrange)
-                              : do_btree_find_prev(&btree_scan_buf[curr_idx].posi, bkrange));
-            if (elem != NULL) {
-                if (efilter == NULL || do_btree_elem_filter(elem, efilter))
-                    break;
-            }
-        } while (elem != NULL);
-
+scan_next:
+        elem = do_btree_scan_next(&btree_scan_buf[curr_idx].posi, bkrtype, bkrange);
         if (elem == NULL) {
             if (btree_scan_buf[curr_idx].posi.node == NULL) {
                 /* reached to the end of b+tree scan */
@@ -4738,41 +5449,16 @@ static int do_btree_smget_elem_sort(btree_scan_info *btree_scan_buf,
             continue;
         }
 
+        if (efilter != NULL && !do_btree_elem_filter(elem, efilter)) {
+            goto scan_next;
+        }
+
         if (sort_count == 1) {
             continue; /* sorting is not needed */
         }
 
-        /* compare with the last element */
-        comp_idx = sort_sindx_buf[first_idx+sort_count-1];
-        comp = BTREE_GET_ELEM_ITEM(btree_scan_buf[comp_idx].posi.node,
-                                   btree_scan_buf[comp_idx].posi.indx);
-
-        cmp_res = BKEY_COMP(elem->data, elem->nbkey, comp->data, comp->nbkey);
-        if (cmp_res == 0) {
-            cmp_res = do_btree_comp_hkey(btree_scan_buf[curr_idx].it,
-                                         btree_scan_buf[comp_idx].it);
-            assert(cmp_res != 0);
-            *bkey_duplicated = true;
-        }
-        if ((ascending ==  true && cmp_res > 0) ||
-            (ascending == false && cmp_res < 0)) {
-            if ((first_idx + sort_count) >= (offset + count)) {
-                first_idx++; sort_count--;
-            } else {
-                for (i = first_idx+1; i < first_idx+sort_count; i++) {
-                    sort_sindx_buf[i-1] = sort_sindx_buf[i];
-                }
-                sort_sindx_buf[first_idx+sort_count-1] = curr_idx;
-            }
-            continue;
-        }
-
-        if (sort_count == 2) {
-            continue; /* sorting has already completed */
-        }
-
         left  = first_idx + 1;
-        right = first_idx + sort_count - 2;
+        right = first_idx + sort_count - 1;
         while (left <= right) {
             mid  = (left + right) / 2;
             comp_idx = sort_sindx_buf[mid];
@@ -4781,10 +5467,10 @@ static int do_btree_smget_elem_sort(btree_scan_info *btree_scan_buf,
 
             cmp_res = BKEY_COMP(elem->data, elem->nbkey, comp->data, comp->nbkey);
             if (cmp_res == 0) {
+                *bkey_duplicated = true;
                 cmp_res = do_btree_comp_hkey(btree_scan_buf[curr_idx].it,
                                              btree_scan_buf[comp_idx].it);
                 assert(cmp_res != 0);
-                *bkey_duplicated = true;
             }
             if (ascending) {
                 if (cmp_res < 0) right = mid-1;
@@ -4796,78 +5482,219 @@ static int do_btree_smget_elem_sort(btree_scan_info *btree_scan_buf,
         }
 
         assert(left > right);
-        /* left : insert position */
-        for (i = first_idx+1; i < left; i++) {
+        /* right : insertion position */
+        for (i = first_idx+1; i <= right; i++) {
             sort_sindx_buf[i-1] = sort_sindx_buf[i];
         }
-        sort_sindx_buf[left-1] = curr_idx;
+        sort_sindx_buf[right] = curr_idx;
     }
     return elem_count;
 }
 #endif
 
-/*
- * Collection Delete Queue Management
- */
-static void push_coll_del_queue(struct default_engine *engine, hash_item *it)
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+static ENGINE_ERROR_CODE
+do_btree_smget_elem_sort(btree_scan_info *btree_scan_buf,
+                         uint16_t *sort_sindx_buf, const int sort_sindx_cnt,
+                         const int bkrtype, const bkey_range *bkrange,
+                         const eflag_filter *efilter,
+                         const uint32_t offset, const uint32_t count,
+                         const bool unique,
+                         smget_result_t *smres)
+#else
+static int do_btree_smget_elem_sort(btree_scan_info *btree_scan_buf,
+                                    uint16_t *sort_sindx_buf, const int sort_sindx_cnt,
+                                    const int bkrtype, const bkey_range *bkrange, const eflag_filter *efilter,
+                                    const uint32_t offset, const uint32_t count,
+                                    btree_elem_item **elem_array, uint32_t *kfnd_array, uint32_t *flag_array,
+                                    bool *potentialbkeytrim, bool *bkey_duplicated)
+#endif
 {
-    /* push the item into the tail of delete queue */
-    it->next = NULL;
-    pthread_mutex_lock(&engine->coll_del_lock);
-    if (engine->coll_del_queue.tail == NULL) {
-        engine->coll_del_queue.head = it;
-    } else {
-        engine->coll_del_queue.tail->next = it;
-    }
-    engine->coll_del_queue.tail = it;
-    engine->coll_del_queue.size++;
-    if (engine->coll_del_sleep == true) {
-        /* wake up collection delete thead */
-        pthread_cond_signal(&engine->coll_del_cond);
-    }
-    pthread_mutex_unlock(&engine->coll_del_lock);
-}
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
+#endif
+    btree_meta_info *info;
+    btree_elem_item *elem, *comp;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    btree_elem_item *prev;
+#endif
+    uint16_t first_idx = 0;
+    uint16_t curr_idx;
+    uint16_t comp_idx;
+    int i, cmp_res;
+    int mid, left, right;
+    int skip_count = 0;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+#else
+    int elem_count = 0;
+#endif
+    int sort_count = sort_sindx_cnt;
+    bool ascending = (bkrtype != BKEY_RANGE_TYPE_DSC ? true : false);
 
-static hash_item *pop_coll_del_queue(struct default_engine *engine)
-{
-    /* pop an item from the head of delete queue */
-    hash_item *it = NULL;
-    pthread_mutex_lock(&engine->coll_del_lock);
-    if (engine->coll_del_queue.head != NULL) {
-        it = engine->coll_del_queue.head;
-        engine->coll_del_queue.head = it->next;
-        if (engine->coll_del_queue.head == NULL) {
-            engine->coll_del_queue.tail = NULL;
+    while (sort_count > 0) {
+        curr_idx = sort_sindx_buf[first_idx];
+        elem = BTREE_GET_ELEM_ITEM(btree_scan_buf[curr_idx].posi.node,
+                                   btree_scan_buf[curr_idx].posi.indx);
+        if (skip_count < offset) {
+            skip_count++;
+        } else { /* skip_count == offset */
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+            smres->elem_array[smres->elem_count] = elem;
+            smres->elem_kinfo[smres->elem_count].kidx = btree_scan_buf[curr_idx].kidx;
+            smres->elem_kinfo[smres->elem_count].flag = btree_scan_buf[curr_idx].it->flags;
+            smres->elem_count += 1;
+#if 1 // JHPARK_SMGET_OFFSET_HANDLING
+#else
+            if (smres->elem_count == 1) { /* the first element is found */
+                if (offset > 0 && smres->trim_count > 0 &&
+                    do_btree_smget_check_trim(smres) != true) {
+                    /* Some elements are trimmed in 0 ~ offset range.
+                     * So, we cannot make the correct smget result.
+                     */
+                    ret = ENGINE_EBKEYOOR; break;
+                }
+            }
+#endif
+            elem->refcount++;
+            if (smres->elem_count >= count) break;
+#else
+            elem->refcount++;
+            elem_array[elem_count] = elem;
+            kfnd_array[elem_count] = btree_scan_buf[curr_idx].kidx;
+            flag_array[elem_count] = btree_scan_buf[curr_idx].it->flags;
+            elem_count++;
+            if (elem_count >= count) break;
+#endif
         }
-        engine->coll_del_queue.size--;
+
+scan_next:
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        prev = elem;
+#endif
+        elem = do_btree_scan_next(&btree_scan_buf[curr_idx].posi, bkrtype, bkrange);
+        if (elem == NULL) {
+            if (btree_scan_buf[curr_idx].posi.node == NULL) {
+                /* reached to the end of b+tree scan */
+                info = (btree_meta_info *)item_get_meta(btree_scan_buf[curr_idx].it);
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+                if ((info->mflags & COLL_META_FLAG_TRIMMED) != 0 &&
+                    do_btree_overlapped_with_trimmed_space(info, &btree_scan_buf[curr_idx].posi, bkrtype)) {
+#if 1 // JHPARK_SMGET_OFFSET_HANDLING
+#else
+                    if (skip_count < offset) {
+                        /* Some elements are trimmed in 0 ~ offset range.
+                         * So, we cannot make correct smget result.
+                         */
+                        assert(smres->elem_count == 0);
+                        ret = ENGINE_EBKEYOOR; break;
+                    }
+#endif
+                    do_btree_smget_add_trim(smres, btree_scan_buf[curr_idx].kidx, prev);
+                }
+#else
+                if ((info->mflags & COLL_META_FLAG_TRIMMED) != 0) {
+                    if (do_btree_overlapped_with_trimmed_space(info, &btree_scan_buf[curr_idx].posi, bkrtype)) {
+                        *potentialbkeytrim = true;
+                        break; /* stop smget */
+                    }
+                }
+#endif
+            }
+            first_idx++; sort_count--;
+            continue;
+        }
+
+        if (efilter != NULL && !do_btree_elem_filter(elem, efilter)) {
+            goto scan_next;
+        }
+
+        if (sort_count == 1) {
+            continue; /* sorting is not needed */
+        }
+
+        left  = first_idx + 1;
+        right = first_idx + sort_count - 1;
+        while (left <= right) {
+            mid  = (left + right) / 2;
+            comp_idx = sort_sindx_buf[mid];
+            comp = BTREE_GET_ELEM_ITEM(btree_scan_buf[comp_idx].posi.node,
+                                       btree_scan_buf[comp_idx].posi.indx);
+
+            cmp_res = BKEY_COMP(elem->data, elem->nbkey, comp->data, comp->nbkey);
+            if (cmp_res == 0) {
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+                smres->duplicated = true;
+                if (unique) break;
+#else
+                *bkey_duplicated = true;
+#endif
+                cmp_res = do_btree_comp_hkey(btree_scan_buf[curr_idx].it,
+                                             btree_scan_buf[comp_idx].it);
+                assert(cmp_res != 0);
+            }
+            if (ascending) {
+                if (cmp_res < 0) right = mid-1;
+                else             left  = mid+1;
+            } else {
+                if (cmp_res > 0) right = mid-1;
+                else             left  = mid+1;
+            }
+        }
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        if (left <= right) { /* Duplicate bkey is found */
+            goto scan_next;
+        }
+
+#else
+
+        assert(left > right);
+#endif
+        /* right : insertion position */
+        for (i = first_idx+1; i <= right; i++) {
+            sort_sindx_buf[i-1] = sort_sindx_buf[i];
+        }
+        sort_sindx_buf[right] = curr_idx;
     }
-    pthread_mutex_unlock(&engine->coll_del_lock);
-    return it;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    if (ret == ENGINE_SUCCESS) {
+        if (smres->trim_count > 0) {
+            do_btree_smget_adjust_trim(smres);
+        }
+    }
+    return ret;
+#else
+    return elem_count;
+#endif
 }
+#endif
 
 /*
  * Item Management Daemon
  */
 static int check_expired_collections(struct default_engine *engine, const int clsid, int *ssl)
 {
-    rel_time_t current_time;
     hash_item *search, *it;
     int unlink_count = 0;
     int space_shortage_level;
     int tries;
+    rel_time_t current_time;
 
-    /* Never-expired items are positioned near the head of LRU list.
-     * To-be-expired items are ordered with expire time near the tail of LRU list.
-     * The smaller expire time leads to near the tail of the LRU list.
-     */
-    space_shortage_level = slabs_space_shortage_level();
-    if (space_shortage_level >= 10 /* refer to SSL_FOR_BACKGROUND_EVICT in slabs.c */
-        && item_evict_to_free == true)
+    if (item_evict_to_free != true) {
+        *ssl = 0;
+        return unlink_count;
+    }
+    if ((space_shortage_level = slabs_space_shortage_level()) < 10) {
+        /* refer to SSL_FOR_BACKGROUND_EVICT in slabs.c */
+        *ssl = space_shortage_level;
+        return unlink_count;
+    }
+
+    tries = space_shortage_level;
+    current_time = engine->server.core->get_current_time();
+
+    pthread_mutex_lock(&engine->cache_lock);
+    if (item_evict_to_free == true)
     {
-        current_time = engine->server.core->get_current_time();
-        tries = space_shortage_level;
-
-        pthread_mutex_lock(&engine->cache_lock);
         search = engine->items.tails[clsid];
         while (search != NULL && tries > 0) {
 #ifdef ENABLE_DETACH_REF_ITEM_FROM_LRU
@@ -4905,8 +5732,9 @@ static int check_expired_collections(struct default_engine *engine, const int cl
             }
 #endif
         }
-        pthread_mutex_unlock(&engine->cache_lock);
     }
+    pthread_mutex_unlock(&engine->cache_lock);
+
     *ssl = space_shortage_level;
     return unlink_count;
 }
@@ -4915,18 +5743,18 @@ static void do_coll_all_elem_delete(struct default_engine *engine, hash_item *it
 {
     if (IS_LIST_ITEM(it)) {
         list_meta_info *info = (list_meta_info *)item_get_meta(it);
-        (void)do_list_elem_delete(engine, info, 0, info->mcnt, ELEM_DELETE_COLL);
+        (void)do_list_elem_delete(engine, info, 0, 0, ELEM_DELETE_COLL);
         assert(info->head == NULL && info->tail == NULL);
     } else if (IS_SET_ITEM(it)) {
         set_meta_info *info = (set_meta_info *)item_get_meta(it);
-        (void)do_set_elem_delete(engine, info, info->mcnt, ELEM_DELETE_COLL);
+        (void)do_set_elem_delete(engine, info, 0, ELEM_DELETE_COLL);
         assert(info->root == NULL);
     } else if (IS_BTREE_ITEM(it)) {
         btree_meta_info *info = (btree_meta_info *)item_get_meta(it);
         bkey_range bkrange_space;
         get_bkey_full_range(info->bktype, true, &bkrange_space);
         (void)do_btree_elem_delete(engine, info, BKEY_RANGE_TYPE_ASC, &bkrange_space,
-                                   NULL, info->mcnt, ELEM_DELETE_COLL);
+                                   NULL, 0, NULL, ELEM_DELETE_COLL);
         assert(info->root == NULL);
     }
 }
@@ -5049,7 +5877,7 @@ static void *collection_delete_thread(void *arg)
                 info = (btree_meta_info *)item_get_meta(it);
                 //deleted_cnt = do_btree_elem_delete(engine, info, BKEY_RANGE_TYPE_ASC, &bkrange_space, NULL, 100);
                 (void)do_btree_elem_delete(engine, info, BKEY_RANGE_TYPE_ASC, &bkrange_space,
-                                           NULL, 100, ELEM_DELETE_COLL);
+                                           NULL, 100, NULL, ELEM_DELETE_COLL);
                 if (info->ccnt == 0) {
                     assert(info->root == NULL);
                     do_item_free(engine, it);
@@ -5110,32 +5938,6 @@ void item_release(struct default_engine *engine, hash_item *item)
     pthread_mutex_lock(&engine->cache_lock);
     do_item_release(engine, item);
     pthread_mutex_unlock(&engine->cache_lock);
-}
-
-/*
- * Unlinks an item from the LRU and hashtable.
- */
-void item_unlink(struct default_engine *engine, hash_item *item)
-{
-    pthread_mutex_lock(&engine->cache_lock);
-    do_item_unlink(engine, item, ITEM_UNLINK_NORMAL);
-    pthread_mutex_unlock(&engine->cache_lock);
-}
-
-/*
- * Does arithmetic on a numeric item value.
- */
-ENGINE_ERROR_CODE add_delta(struct default_engine *engine,
-                            hash_item *item, const bool incr,
-                            const int64_t delta, uint64_t *rcas,
-                            uint64_t *result, const void *cookie)
-{
-    ENGINE_ERROR_CODE ret;
-
-    pthread_mutex_lock(&engine->cache_lock);
-    ret = do_add_delta(engine, item, incr, delta, rcas, result, cookie);
-    pthread_mutex_unlock(&engine->cache_lock);
-    return ret;
 }
 
 /*
@@ -5221,6 +6023,42 @@ ENGINE_ERROR_CODE arithmetic(struct default_engine *engine,
 }
 
 /*
+ * Delete an item.
+ */
+
+static ENGINE_ERROR_CODE do_item_delete(struct default_engine *engine,
+                                        const void* key, const size_t nkey,
+                                        uint64_t cas)
+{
+    ENGINE_ERROR_CODE ret;
+    hash_item *it = do_item_get(engine, key, nkey, true);
+    if (it == NULL) {
+        ret = ENGINE_KEY_ENOENT;
+    } else {
+        if (cas == 0 || cas == item_get_cas(it)) {
+            do_item_unlink(engine, it, ITEM_UNLINK_NORMAL);
+            ret = ENGINE_SUCCESS;
+        } else {
+            ret = ENGINE_KEY_EEXISTS;
+        }
+        do_item_release(engine, it);
+    }
+    return ret;
+}
+
+ENGINE_ERROR_CODE item_delete(struct default_engine *engine,
+                              const void* key, const size_t nkey,
+                              uint64_t cas)
+{
+    ENGINE_ERROR_CODE ret;
+
+    pthread_mutex_lock(&engine->cache_lock);
+    ret = do_item_delete(engine, key, nkey, cas);
+    pthread_mutex_unlock(&engine->cache_lock);
+    return ret;
+}
+
+/*
  * Flushes expired items after a flush_all call
  */
 
@@ -5294,13 +6132,11 @@ static ENGINE_ERROR_CODE do_item_flush_expired(struct default_engine *engine,
                                 *(iter_key + nprefix) == engine->config.prefix_delimiter)
                                 found = true;
                         }
-                        if (found == true && (iter->iflag & ITEM_SLABBED) == 0) {
+                        if (found == true) {
                             do_item_unlink(engine, iter, ITEM_UNLINK_INVALID);
                         }
                     } else { /* flush all */
-                        if ((iter->iflag & ITEM_SLABBED) == 0) {
-                            do_item_unlink(engine, iter, ITEM_UNLINK_INVALID);
-                        }
+                        do_item_unlink(engine, iter, ITEM_UNLINK_INVALID);
                     }
                 } else {
                     /* We've hit the first old item. Continue to the next queue. */
@@ -5326,13 +6162,11 @@ static ENGINE_ERROR_CODE do_item_flush_expired(struct default_engine *engine,
                                 *(iter_key + nprefix) == engine->config.prefix_delimiter)
                                 found = true;
                         }
-                        if (found == true && (iter->iflag & ITEM_SLABBED) == 0) {
+                        if (found == true) {
                             do_item_unlink(engine, iter, ITEM_UNLINK_INVALID);
                         }
                     } else { /* flush all */
-                        if ((iter->iflag & ITEM_SLABBED) == 0) {
-                            do_item_unlink(engine, iter, ITEM_UNLINK_INVALID);
-                        }
+                        do_item_unlink(engine, iter, ITEM_UNLINK_INVALID);
                     }
                 } else {
                     /* We've hit the first old item. Continue to the next queue. */
@@ -5433,10 +6267,11 @@ ENGINE_ERROR_CODE item_init(struct default_engine *engine)
     logger->log(EXTENSION_LOG_INFO, NULL, "maximum set   size = %d\n", max_set_size);
     logger->log(EXTENSION_LOG_INFO, NULL, "maximum btree size = %d\n", max_btree_size);
 
-    pthread_t tid;
-    int ret = pthread_create(&tid, NULL, collection_delete_thread, engine);
+    int ret = pthread_create(&engine->coll_del_tid, NULL,
+                             collection_delete_thread, engine);
     if (ret != 0) {
-        fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Can't create thread: %s\n", strerror(ret));
         return ENGINE_FAILED;
     }
 
@@ -5446,7 +6281,46 @@ ENGINE_ERROR_CODE item_init(struct default_engine *engine)
         uint64_t val2 = 20;
         assert(UINT64_COMPARE_OP[COMPARE_OP_LT](&val1, &val2) == true);
     }
+
+    logger->log(EXTENSION_LOG_INFO, NULL, "ITEM module initialized.\n");
     return ENGINE_SUCCESS;
+}
+
+void item_final(struct default_engine *engine)
+{
+#ifdef JHPARK_KEY_DUMP
+    if (engine->dumper.running) {
+        /* stop the dumper */
+        pthread_mutex_lock(&engine->dumper.lock);
+        do_item_dump_stop(engine);
+        pthread_mutex_unlock(&engine->dumper.lock);
+    }
+#endif
+    coll_del_thread_wakeup(engine);
+    pthread_join(engine->coll_del_tid, NULL);
+
+    int sleep_count = 0;
+    while (engine->scrubber.running) {
+        usleep(1000); // 1ms;
+        sleep_count++;
+    }
+    if (sleep_count > 100) { // waited too long
+        logger->log(EXTENSION_LOG_INFO, NULL,
+                "Waited %d ms for scrubber to be stopped.\n", sleep_count);
+    }
+#ifdef JHPARK_KEY_DUMP
+    /* wait until dumper thread is finiahed. */
+    sleep_count = 0;
+    while (engine->dumper.running) {
+        usleep(1000); // 1ms;
+        sleep_count++;
+    }
+    if (sleep_count > 100) { // waited too long
+        logger->log(EXTENSION_LOG_INFO, NULL,
+                "Waited %d ms for dumper to be stopped.\n", sleep_count);
+    }
+#endif
+    logger->log(EXTENSION_LOG_INFO, NULL, "ITEM module destroyed.\n");
 }
 
 /*
@@ -5508,98 +6382,32 @@ ENGINE_ERROR_CODE list_elem_insert(struct default_engine *engine,
                                    item_attr *attrp,
                                    bool *created, const void *cookie)
 {
-    hash_item      *it;
-    list_meta_info *info=NULL;
+    hash_item *it = NULL;
     ENGINE_ERROR_CODE ret;
 
     *created = false;
 
     pthread_mutex_lock(&engine->cache_lock);
     ret = do_list_item_find(engine, key, nkey, false, &it);
-    do {
-        if (ret == ENGINE_SUCCESS) { /* it != NULL */
-            info = (list_meta_info *)item_get_meta(it);
-            /* validation check: index value */
-            if (index >= 0) {
-                if (index > info->ccnt || index > (info->mcnt-1)) {
-                    ret = ENGINE_EINDEXOOR; break;
-                }
-            } else {
-                if ((-index) > (info->ccnt+1) || (-index) > info->mcnt) {
-                    ret = ENGINE_EINDEXOOR; break;
-                }
-            }
-#ifdef ENABLE_STICKY_ITEM
-            /* sticky memory limit check */
-            if ((info->mflags & COLL_META_FLAG_STICKY) != 0) {
-                if (engine->stats.sticky_bytes >= engine->config.sticky_limit) {
-                    ret = ENGINE_ENOMEM; break;
-                }
-            }
-#endif
-            /* overflow check */
-            if (info->ccnt >= info->mcnt) {
-                if (info->ovflact == OVFL_ERROR) {
-                    ret = ENGINE_EOVERFLOW; break;
-                }
-                if (index == 0 || index == -1) {
-                    /* delete an element item of opposite side to make room */
-                    uint32_t deleted = do_list_elem_delete(engine, info,
-                                                           (index==-1 ? 0 : -1), 1,
-                                                           ELEM_DELETE_TRIM);
-                    assert(deleted == 1);
-                } else {
-                    /* delete an element item that overflow action indicates */
-                    uint32_t deleted = do_list_elem_delete(engine, info,
-                                                           (info->ovflact==OVFL_HEAD_TRIM ? 0 : -1), 1,
-                                                           ELEM_DELETE_TRIM);
-                    assert(deleted == 1);
-                    /* adjust list index value */
-                    if (info->ovflact == OVFL_HEAD_TRIM) {
-                      if (index > 0) index -= 1;
-                    } else { /* ovflact == OVFL_TAIL_TRIM */
-                      if (index < 0) index += 1;
-                    }
-                }
-            }
-        } else if (ret == ENGINE_KEY_ENOENT) {
-            if (attrp != NULL) {
-                /* validation check: index value */
-                if (index != 0 && index != -1) {
-                    ret = ENGINE_EINDEXOOR; break;
-                }
-                /* allocate list item */
-                it = do_list_item_alloc(engine, key, nkey, attrp, cookie);
-                if (it == NULL) {
-                    ret = ENGINE_ENOMEM; break;
-                }
-                ret = do_item_link(engine, it);
-                if (ret != ENGINE_SUCCESS) {
-                    /* The list item is to be released in the outside of do-while loop */
-                    break;
-                }
-                info = (list_meta_info *)item_get_meta(it);
-                *created = true;
-                ret = ENGINE_SUCCESS;
-            }
-        }
-
-        if (ret == ENGINE_SUCCESS) {
-            ret = do_list_elem_link(engine, info, index, elem);
-            if (ret != ENGINE_SUCCESS) {
-                if (*created) {
-                    /* unlink the created list item and free it*/
-                    do_item_release(engine, it);
-                    do_item_unlink(engine, it, ITEM_UNLINK_ABORT);
-                    it = NULL;
-                }
-                break;
-            }
+    if (ret == ENGINE_KEY_ENOENT && attrp != NULL) {
+        it = do_list_item_alloc(engine, key, nkey, attrp, cookie);
+        if (it == NULL) {
+            ret = ENGINE_ENOMEM;
         } else {
-            /* ENGINE_KEY_ENOENT | ENGINE_EBADTYPE */
+            ret = do_item_link(engine, it);
+            if (ret == ENGINE_SUCCESS) {
+                *created = true;
+            } else {
+                /* The item is to be released, below */
+            }
         }
-    } while(0);
-
+    }
+    if (ret == ENGINE_SUCCESS) {
+        ret = do_list_elem_insert(engine, it, index, elem, cookie);
+        if (ret != ENGINE_SUCCESS && *created) {
+            do_item_unlink(engine, it, ITEM_UNLINK_ABORT);
+        }
+    }
     if (it != NULL) do_item_release(engine, it);
     pthread_mutex_unlock(&engine->cache_lock);
     return ret;
@@ -5776,82 +6584,32 @@ void set_elem_release(struct default_engine *engine, set_elem_item **elem_array,
 ENGINE_ERROR_CODE set_elem_insert(struct default_engine *engine, const char *key, const size_t nkey,
                                   set_elem_item *elem, item_attr *attrp, bool *created, const void *cookie)
 {
-    hash_item     *it;
-    set_meta_info *info=NULL;
+    hash_item *it = NULL;
     ENGINE_ERROR_CODE ret;
 
     *created = false;
 
     pthread_mutex_lock(&engine->cache_lock);
     ret = do_set_item_find(engine, key, nkey, false, &it);
-    do {
-        if (ret == ENGINE_SUCCESS) { /* it != NULL */
-            info = (set_meta_info *)item_get_meta(it);
-#ifdef ENABLE_STICKY_ITEM
-            /* sticky memory limit check */
-            if ((info->mflags & COLL_META_FLAG_STICKY) != 0) {
-                if (engine->stats.sticky_bytes >= engine->config.sticky_limit) {
-                    ret = ENGINE_ENOMEM; break;
-                }
-            }
-#endif
-            /* overflow check */
-            if (info->ccnt >= info->mcnt) {
-                ret = ENGINE_EOVERFLOW; break;
-            }
-        } else if (ret == ENGINE_KEY_ENOENT) {
-            if (attrp != NULL) {
-                it = do_set_item_alloc(engine, key, nkey, attrp, cookie);
-                if (it == NULL) {
-                    ret = ENGINE_ENOMEM; break;
-                }
-                ret = do_item_link(engine, it);
-                if (ret != ENGINE_SUCCESS) {
-                    /* The set item is to be released in the outside of do-while loop */
-                    break;
-                }
-                info = (set_meta_info *)item_get_meta(it);
-                *created = true;
-                ret = ENGINE_SUCCESS;
-            }
-        }
-
-        if (ret == ENGINE_SUCCESS) {
-            bool new_root_flag = false;
-            if (info->root == NULL) { /* empty set */
-                set_hash_node *r_node = do_set_node_alloc(engine, 0, cookie);
-                if (r_node == NULL) {
-                    if (*created) {
-                        /* unlink the created set item and free it */
-                        do_item_release(engine, it);
-                        do_item_unlink(engine, it, ITEM_UNLINK_ABORT);
-                        it = NULL;
-                    }
-                    ret = ENGINE_ENOMEM; break;
-                }
-                do_set_node_link(engine, info, NULL, 0, r_node);
-                new_root_flag = true;
-            }
-
-            ret = do_set_elem_link(engine, info, elem, cookie);
-            if (ret != ENGINE_SUCCESS) {
-                if (new_root_flag) {
-                    /* unlink the root node and free it */
-                    do_set_node_unlink(engine, info, NULL, 0);
-                }
-                if (*created) {
-                    /* unlink the created set item and free it*/
-                    do_item_release(engine, it);
-                    do_item_unlink(engine, it, ITEM_UNLINK_ABORT);
-                    it = NULL;
-                }
-                break;
-            }
+    if (ret == ENGINE_KEY_ENOENT && attrp != NULL) {
+        it = do_set_item_alloc(engine, key, nkey, attrp, cookie);
+        if (it == NULL) {
+            ret = ENGINE_ENOMEM;
         } else {
-            /* ENGINE_KEY_ENOENT | ENGINE_EBADTYPE */
+            ret = do_item_link(engine, it);
+            if (ret == ENGINE_SUCCESS) {
+                *created = true;
+            } else {
+                /* The item is to be released, below */
+            }
         }
-    } while(0);
-
+    }
+    if (ret == ENGINE_SUCCESS) {
+        ret = do_set_elem_insert(engine, it, elem, cookie);
+        if (ret != ENGINE_SUCCESS && *created) {
+            do_item_unlink(engine, it, ITEM_UNLINK_ABORT);
+        }
+    }
     if (it != NULL) do_item_release(engine, it);
     pthread_mutex_unlock(&engine->cache_lock);
     return ret;
@@ -6012,8 +6770,7 @@ ENGINE_ERROR_CODE btree_elem_insert(struct default_engine *engine,
                                     bool *replaced, bool *created, btree_elem_item **trimmed_elems,
                                     uint32_t *trimmed_count, uint32_t *trimmed_flags, const void *cookie)
 {
-    hash_item       *it;
-    btree_meta_info *info=NULL;
+    hash_item *it = NULL;
     ENGINE_ERROR_CODE ret;
 
     *created = false;
@@ -6025,70 +6782,29 @@ ENGINE_ERROR_CODE btree_elem_insert(struct default_engine *engine,
 
     pthread_mutex_lock(&engine->cache_lock);
     ret = do_btree_item_find(engine, key, nkey, false, &it);
-    do {
-        if (ret == ENGINE_SUCCESS) {
-            info = (btree_meta_info *)item_get_meta(it);
-            if (info->ccnt > 0 || info->maxbkeyrange.len != BKEY_NULL) {
-                if ((info->bktype == BKEY_TYPE_UINT64 && elem->nbkey >  0) ||
-                    (info->bktype == BKEY_TYPE_BINARY && elem->nbkey == 0)) {
-                    ret = ENGINE_EBADBKEY; break;
-                }
-            }
-        } else if (ret == ENGINE_KEY_ENOENT) {
-            if (attrp != NULL) {
-                it = do_btree_item_alloc(engine, key, nkey, attrp, cookie);
-                if (it == NULL) {
-                    ret = ENGINE_ENOMEM; break;
-                }
-                ret = do_item_link(engine, it);
-                if (ret != ENGINE_SUCCESS) {
-                    break; /* The btree item will be released in the outside of do-while loop */
-                }
-                info = (btree_meta_info *)item_get_meta(it);
-                *created = true;
-                ret = ENGINE_SUCCESS;
-            }
-        }
-
-        if (ret == ENGINE_SUCCESS) {
-            bool new_root_flag = false;
-            if (info->root == NULL) {
-                btree_indx_node *r_node = do_btree_node_alloc(engine, 0, cookie);
-                if (r_node == NULL) {
-                    if (*created) {
-                        /* unlink the created btree item and free it */
-                        do_item_release(engine, it);
-                        do_item_unlink(engine, it, ITEM_UNLINK_ABORT);
-                        it = NULL;
-                    }
-                    ret = ENGINE_ENOMEM; break;
-                }
-                do_btree_node_link(engine, info, r_node, NULL);
-                new_root_flag = true;
-            }
-            ret = do_btree_elem_link(engine, info, elem, replace_if_exist, replaced,
-                                     trimmed_elems, trimmed_count, cookie);
-            if (ret != ENGINE_SUCCESS) {
-                if (new_root_flag) {
-                    /* unlink the root node and free it */
-                    do_btree_node_unlink(engine, info, info->root, NULL);
-                }
-                if (*created) {
-                    /* unlink the created btree item and free it */
-                    do_item_release(engine, it);
-                    do_item_unlink(engine, it, ITEM_UNLINK_ABORT);
-                    it = NULL;
-                }
-                break;
-            }
-            if (trimmed_elems != NULL && *trimmed_elems != NULL) {
-                *trimmed_flags = it->flags;
-            }
+    if (ret == ENGINE_KEY_ENOENT && attrp != NULL) {
+        it = do_btree_item_alloc(engine, key, nkey, attrp, cookie);
+        if (it == NULL) {
+            ret = ENGINE_ENOMEM;
         } else {
-            /* ENGINE_KEY_ENOENT | ENGINE_EBADTYPE */
+            ret = do_item_link(engine, it);
+            if (ret == ENGINE_SUCCESS) {
+                *created = true;
+            } else {
+                /* The item is to be released, below */
+            }
         }
-    } while(0);
-
+    }
+    if (ret == ENGINE_SUCCESS) {
+        ret = do_btree_elem_insert(engine, it, elem, replace_if_exist, replaced,
+                                   trimmed_elems, trimmed_count, cookie);
+        if (ret != ENGINE_SUCCESS && *created) {
+            do_item_unlink(engine, it, ITEM_UNLINK_ABORT);
+        }
+        if (trimmed_elems != NULL && *trimmed_elems != NULL) {
+            *trimmed_flags = it->flags;
+        }
+    }
     if (it != NULL) do_item_release(engine, it);
     pthread_mutex_unlock(&engine->cache_lock);
     return ret;
@@ -6130,7 +6846,7 @@ ENGINE_ERROR_CODE btree_elem_delete(struct default_engine *engine,
                                     const char *key, const size_t nkey,
                                     const bkey_range *bkrange, const eflag_filter *efilter,
                                     const uint32_t req_count, const bool drop_if_empty,
-                                    uint32_t *del_count, bool *dropped)
+                                    uint32_t *del_count, uint32_t *access_count, bool *dropped)
 {
     hash_item       *it;
     btree_meta_info *info;
@@ -6150,7 +6866,7 @@ ENGINE_ERROR_CODE btree_elem_delete(struct default_engine *engine,
                 ret = ENGINE_EBADBKEY; break;
             }
             *del_count = do_btree_elem_delete(engine, info, bkrtype, bkrange, efilter, req_count,
-                                              ELEM_DELETE_NORMAL);
+                                              access_count, ELEM_DELETE_NORMAL);
             if (*del_count > 0) {
                 if (info->ccnt == 0 && drop_if_empty) {
                     assert(info->root == NULL);
@@ -6226,6 +6942,7 @@ ENGINE_ERROR_CODE btree_elem_get(struct default_engine *engine,
                                  const uint32_t offset, const uint32_t req_count,
                                  const bool delete, const bool drop_if_empty,
                                  btree_elem_item **elem_array, uint32_t *elem_count,
+                                 uint32_t *access_count,
                                  uint32_t *flags, bool *dropped_trimmed)
 {
     hash_item       *it;
@@ -6249,8 +6966,9 @@ ENGINE_ERROR_CODE btree_elem_get(struct default_engine *engine,
                 (info->bktype == BKEY_TYPE_BINARY && bkrange->from_nbkey == 0)) {
                 ret = ENGINE_EBADBKEY; break;
             }
-            *elem_count = do_btree_elem_get(engine, info, bkrtype, bkrange, efilter, offset, req_count,
-                                            delete, elem_array, &potentialbkeytrim);
+            *elem_count = do_btree_elem_get(engine, info, bkrtype, bkrange, efilter,
+                                            offset, req_count, delete,
+                                            elem_array, access_count, &potentialbkeytrim);
             if (*elem_count > 0) {
                 if (delete) {
                     if (info->ccnt == 0 && drop_if_empty) {
@@ -6280,7 +6998,7 @@ ENGINE_ERROR_CODE btree_elem_get(struct default_engine *engine,
 ENGINE_ERROR_CODE btree_elem_count(struct default_engine *engine,
                                    const char *key, const size_t nkey,
                                    const bkey_range *bkrange, const eflag_filter *efilter,
-                                   uint32_t *elem_count, uint32_t *flags)
+                                   uint32_t *elem_count, uint32_t *access_count)
 {
     hash_item       *it;
     btree_meta_info *info;
@@ -6299,8 +7017,8 @@ ENGINE_ERROR_CODE btree_elem_count(struct default_engine *engine,
                 (info->bktype == BKEY_TYPE_BINARY && bkrange->from_nbkey == 0)) {
                 ret = ENGINE_EBADBKEY; break;
             }
-            *elem_count = do_btree_elem_count(engine, info, bkrtype, bkrange, efilter);
-            *flags = it->flags;
+            *elem_count = do_btree_elem_count(engine, info, bkrtype, bkrange, efilter,
+                                              access_count);
         } while (0);
         do_item_release(engine, it);
     }
@@ -6441,7 +7159,8 @@ ENGINE_ERROR_CODE btree_elem_get_by_posi(struct default_engine *engine,
 }
 
 #ifdef SUPPORT_BOP_SMGET
-ENGINE_ERROR_CODE btree_elem_smget(struct default_engine *engine,
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+ENGINE_ERROR_CODE btree_elem_smget_old(struct default_engine *engine,
                                    token_t *key_array, const int key_count,
                                    const bkey_range *bkrange, const eflag_filter *efilter,
                                    const uint32_t offset, const uint32_t count,
@@ -6469,6 +7188,106 @@ ENGINE_ERROR_CODE btree_elem_smget(struct default_engine *engine,
     pthread_mutex_lock(&engine->cache_lock);
 
     /* the 1st phase: get the sorted scans */
+    ret = do_btree_smget_scan_sort_old(engine, key_array, key_count,
+                                   bkrtype, bkrange, efilter, (offset+count),
+                                   btree_scan_buf, sort_sindx_buf, &sort_sindx_cnt,
+                                   missed_key_array, missed_key_count, duplicated);
+    if (ret == ENGINE_SUCCESS) {
+        /* the 2nd phase: get the sorted elems */
+        *elem_count = do_btree_smget_elem_sort_old(btree_scan_buf, sort_sindx_buf, sort_sindx_cnt,
+                                               bkrtype, bkrange, efilter, offset, count,
+                                               elem_array, kfnd_array, flag_array,
+                                               trimmed, duplicated);
+        for (i = 0; i <= (offset+count); i++) {
+            if (btree_scan_buf[i].it != NULL)
+                do_item_release(engine, btree_scan_buf[i].it);
+        }
+    }
+
+    pthread_mutex_unlock(&engine->cache_lock);
+
+    return ret;
+}
+#endif
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+ENGINE_ERROR_CODE btree_elem_smget(struct default_engine *engine,
+                                   token_t *key_array, const int key_count,
+                                   const bkey_range *bkrange, const eflag_filter *efilter,
+                                   const uint32_t offset, const uint32_t count,
+                                   const bool unique,
+                                   smget_result_t *result)
+#else
+ENGINE_ERROR_CODE btree_elem_smget(struct default_engine *engine,
+                                   token_t *key_array, const int key_count,
+                                   const bkey_range *bkrange, const eflag_filter *efilter,
+                                   const uint32_t offset, const uint32_t count,
+                                   btree_elem_item **elem_array, uint32_t *kfnd_array,
+                                   uint32_t *flag_array, uint32_t *elem_count,
+                                   uint32_t *missed_key_array, uint32_t *missed_key_count,
+                                   bool *trimmed, bool *duplicated)
+#endif
+{
+    assert(key_count > 0);
+    assert(count > 0 && (offset+count) <= MAX_SMGET_REQ_COUNT);
+    btree_scan_info btree_scan_buf[offset+count+1];
+    uint16_t        sort_sindx_buf[offset+count]; /* sorted scan index buffer */
+    uint32_t        sort_sindx_cnt, i;
+    int             bkrtype = do_btree_bkey_range_type(bkrange);
+    ENGINE_ERROR_CODE ret;
+
+    /* prepare */
+    for (i = 0; i <= (offset+count); i++) {
+        btree_scan_buf[i].it = NULL;
+    }
+
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+    /* initialize smget result structure */
+    assert(result->elem_array != NULL);
+    result->trim_elems = (eitem *)&result->elem_array[count];
+    result->elem_kinfo = (smget_ehit_t *)&result->elem_array[count + key_count];
+    result->miss_kinfo = (smget_emis_t *)&result->elem_kinfo[count];
+    result->trim_kinfo = result->miss_kinfo;
+    result->elem_count = 0;
+    result->miss_count = 0;
+    result->trim_count = 0;
+    result->elem_arrsz = count;
+    result->keys_arrsz = key_count;
+    result->duplicated = false;
+    result->ascending = (bkrtype != BKEY_RANGE_TYPE_DSC ? true : false);
+
+    pthread_mutex_lock(&engine->cache_lock);
+    do {
+        /* the 1st phase: get the sorted scans */
+        ret = do_btree_smget_scan_sort(engine, key_array, key_count,
+                                       bkrtype, bkrange, efilter, (offset+count), unique,
+                                       btree_scan_buf, sort_sindx_buf, &sort_sindx_cnt,
+                                       result);
+        if (ret != ENGINE_SUCCESS) {
+            break;
+        }
+
+        /* the 2nd phase: get the sorted elems */
+        ret = do_btree_smget_elem_sort(btree_scan_buf, sort_sindx_buf, sort_sindx_cnt,
+                                       bkrtype, bkrange, efilter, offset, count, unique,
+                                       result);
+        if (ret != ENGINE_SUCCESS) {
+            break;
+        }
+
+        for (i = 0; i <= (offset+count); i++) {
+            if (btree_scan_buf[i].it != NULL)
+                do_item_release(engine, btree_scan_buf[i].it);
+        }
+    } while(0);
+    pthread_mutex_unlock(&engine->cache_lock);
+#else
+    *trimmed = false;
+    *duplicated = false;
+
+    pthread_mutex_lock(&engine->cache_lock);
+
+    /* the 1st phase: get the sorted scans */
     ret = do_btree_smget_scan_sort(engine, key_array, key_count,
                                    bkrtype, bkrange, efilter, (offset+count),
                                    btree_scan_buf, sort_sindx_buf, &sort_sindx_cnt,
@@ -6486,6 +7305,7 @@ ENGINE_ERROR_CODE btree_elem_smget(struct default_engine *engine,
     }
 
     pthread_mutex_unlock(&engine->cache_lock);
+#endif
 
     return ret;
 }
@@ -6543,7 +7363,27 @@ ENGINE_ERROR_CODE item_getattr(struct default_engine *engine,
             if (ret == ENGINE_SUCCESS) {
                 coll_meta_info *info = (coll_meta_info *)item_get_meta(it);
                 attr_data->count      = info->ccnt;
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+                if (info->mcnt > 0) {
+                    attr_data->maxcount   = info->mcnt;
+                } else {
+                    switch (attr_data->type) {
+                      case ITEM_TYPE_LIST:
+                           attr_data->maxcount = max_list_size;
+                           break;
+                      case ITEM_TYPE_SET:
+                           attr_data->maxcount = max_set_size;
+                           break;
+                      case ITEM_TYPE_BTREE:
+                           attr_data->maxcount = max_btree_size;
+                           break;
+                      default:
+                           attr_data->maxcount = 0;
+                    }
+                }
+#else
                 attr_data->maxcount   = info->mcnt;
+#endif
                 attr_data->ovflaction = info->ovflact;
                 attr_data->readable   = (((info->mflags & COLL_META_FLAG_READABLE) != 0) ? 1 : 0);
                 if (attr_data->type == ITEM_TYPE_BTREE) {
@@ -6610,9 +7450,15 @@ ENGINE_ERROR_CODE item_setattr(struct default_engine *engine,
             }
             if (attr_ids[i] == ATTR_MAXCOUNT) {
                 attr_data->maxcount = do_coll_real_maxcount(it, attr_data->maxcount);
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+                if (attr_data->maxcount > 0 && attr_data->maxcount < info->ccnt) {
+                    ret = ENGINE_EBADVALUE; break;
+                }
+#else
                 if (info->ccnt > attr_data->maxcount) {
                     ret = ENGINE_EBADVALUE; break;
                 }
+#endif
             } else if (attr_ids[i] == ATTR_OVFLACTION) {
                 if (attr_data->ovflaction == OVFL_ERROR) {
                     /* nothing to check */
@@ -6737,6 +7583,47 @@ ENGINE_ERROR_CODE item_setattr(struct default_engine *engine,
 /*
  * Item config functions
  */
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+ENGINE_ERROR_CODE item_conf_set_maxcollsize(struct default_engine *engine,
+                                            const int coll_type, int *maxsize)
+{
+    ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
+
+    pthread_mutex_lock(&engine->cache_lock);
+    if (*maxsize < 0 || *maxsize > coll_size_limit) {
+        *maxsize = coll_size_limit;
+    }
+    switch (coll_type) {
+      case ITEM_TYPE_LIST:
+           if (*maxsize <= max_list_size) {
+               ret = ENGINE_EBADVALUE;
+           } else {
+               max_list_size = *maxsize;
+               engine->config.max_list_size = *maxsize;
+           }
+           break;
+      case ITEM_TYPE_SET:
+           if (*maxsize <= max_set_size) {
+               ret = ENGINE_EBADVALUE;
+           } else {
+               max_set_size = *maxsize;
+               engine->config.max_set_size = *maxsize;
+           }
+           break;
+      case ITEM_TYPE_BTREE:
+           if (*maxsize <= max_btree_size) {
+               ret = ENGINE_EBADVALUE;
+           } else {
+               max_btree_size = *maxsize;
+               engine->config.max_btree_size = *maxsize;
+           }
+           break;
+    }
+    pthread_mutex_unlock(&engine->cache_lock);
+    return ret;
+}
+#endif
+
 bool item_conf_get_evict_to_free(struct default_engine *engine)
 {
     bool value;
@@ -6942,6 +7829,9 @@ static void item_scrub_class(struct default_engine *engine, int lruid, bool stic
     gettimeofday(&start_time, 0);
 #endif
     do {
+       if (!engine->initialized)
+           break;
+
         /* long-running background task.
          * hold the cache lock lazily in order to give priority to normal workers.
          */
@@ -6984,6 +7874,8 @@ static void *item_scubber_main(void *arg)
 
     for (int ii = 0; ii < MAX_NUMBER_OF_SLAB_CLASSES; ++ii)
     {
+        if (!engine->initialized) break;
+
         pthread_mutex_lock(&engine->cache_lock);
         if (engine->items.heads[ii] != NULL) {
             engine->items.scrub[ii] = engine->items.heads[ii];
@@ -7072,3 +7964,292 @@ void item_stats_scrub(struct default_engine *engine,
     }
     pthread_mutex_unlock(&engine->scrubber.lock);
 }
+
+#ifdef JHPARK_KEY_DUMP
+#define DUMP_BUFFER_SIZE (64 * 1024)
+static void *item_dumper_main(void *arg)
+{
+    struct default_engine *engine = arg;
+    struct engine_dumper *dumper = &engine->dumper;
+    hash_item *it;
+    struct assoc_scan scan;
+    int fd, ret = 0;
+    int i, nwritten;
+    int cur_buflen = 0;
+    int max_buflen = DUMP_BUFFER_SIZE;
+    static char dump_buffer[DUMP_BUFFER_SIZE];
+    char *cur_bufptr = dump_buffer;
+    time_t     real_nowtime; /* real now time */
+    rel_time_t memc_curtime; /* current time of cache server */
+    int str_length;
+
+    assert(dumper->running == true);
+
+    fd = open(dumper->filepath, O_WRONLY | O_CREAT | O_TRUNC,
+                                S_IRUSR | S_IWUSR | S_IRGRP);
+    if (fd < 0) {
+        logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "Failed to open the dump file. path=%s err=%s\n",
+                    dumper->filepath, strerror(errno));
+        ret = -1; goto done;
+    }
+
+    assoc_scan_init(engine, &scan);
+
+    pthread_mutex_lock(&engine->cache_lock);
+    while (scan.cur_bucket < scan.max_bucket)
+    {
+        if (!engine->initialized || dumper->stop) {
+            logger->log(EXTENSION_LOG_INFO, NULL, "Stop the current dump.\n");
+            ret = -1; break;
+        }
+
+        assoc_scan_next(engine, &scan);
+        for (i = 0; i < scan.item_count; i++) {
+            ITEM_REFCOUNT_INCR(scan.item_array[i]);
+        }
+        pthread_mutex_unlock(&engine->cache_lock);
+
+        /* write key string to buffer */
+        real_nowtime = time(NULL);
+        memc_curtime = engine->server.core->get_current_time();
+        for (i = 0; i < scan.item_count; i++) {
+            it = scan.item_array[i];
+            dumper->visited++;
+            /* check prefix name */
+            if (dumper->nprefix > 0) {
+                if (dumper->nprefix != it->nprefix || it->nprefix == it->nkey ||
+                    memcmp(item_get_key(it), dumper->prefix, dumper->nprefix) != 0) {
+                    continue; /* prefix mismatch */
+                }
+            } else if (dumper->nprefix == 0) {
+                if (it->nprefix != it->nkey) {
+                    continue; /* not null prefix */
+                }
+            }
+            if ((cur_buflen + it->nkey + 24) > max_buflen) {
+                nwritten = write(fd, dump_buffer, cur_buflen);
+                if (nwritten != cur_buflen) {
+                    logger->log(EXTENSION_LOG_WARNING, NULL, "Failed to write the dump: "
+                                "nwritten(%d) != writelen(%d)\n", nwritten, cur_buflen);
+                    ret = -1; break;
+                }
+                cur_buflen = 0;
+                cur_bufptr = dump_buffer;
+            }
+            dumper->dumpped++;
+            /* key item type: L(list), S(set), B(b+tree), K(kv) */
+            if (IS_LIST_ITEM(it))       memcpy(cur_bufptr, "L ", 2);
+            else if (IS_SET_ITEM(it))   memcpy(cur_bufptr, "S ", 2);
+            else if (IS_BTREE_ITEM(it)) memcpy(cur_bufptr, "B ", 2);
+            else                        memcpy(cur_bufptr, "K ", 2);
+            cur_bufptr += 2;
+            cur_buflen += 2;
+            /* key string */
+            memcpy(cur_bufptr, item_get_key(it), it->nkey);
+            cur_bufptr += it->nkey;
+            cur_buflen += it->nkey;
+            /* exptime and new line */
+            if (it->exptime == 0) {
+                memcpy(cur_bufptr, " 0\n", 3);
+                cur_bufptr += 3;
+                cur_buflen += 3;
+#ifdef ENABLE_STICKY_ITEM
+            } else if (it->exptime == (rel_time_t)-1) {
+                memcpy(cur_bufptr, " -1\n", 4);
+                cur_bufptr += 4;
+                cur_buflen += 4;
+#endif
+            } else {
+                if (it->exptime > memc_curtime) {
+                    snprintf(cur_bufptr, 22, " %"PRIu64"\n",
+                             (uint64_t)(real_nowtime + (it->exptime - memc_curtime)));
+                } else {
+                    snprintf(cur_bufptr, 22, " %"PRIu64"\n", (uint64_t)real_nowtime);
+                }
+                str_length = strlen(cur_bufptr);
+                cur_bufptr += str_length;
+                cur_buflen += str_length;
+            }
+        }
+
+        pthread_mutex_lock(&engine->cache_lock);
+        for (i = 0; i < scan.item_count; i++) {
+            ITEM_REFCOUNT_DECR(scan.item_array[i]);
+        }
+        if (ret != 0) break;
+    }
+    pthread_mutex_unlock(&engine->cache_lock);
+
+    assoc_scan_final(engine, &scan);
+
+    if (ret == 0) {
+        int summary_length = 256; /* just, enough memory space size */
+        if ((cur_buflen + summary_length) > max_buflen) {
+            nwritten = write(fd, dump_buffer, cur_buflen);
+            if (nwritten != cur_buflen) {
+                logger->log(EXTENSION_LOG_WARNING, NULL, "Failed to write the dump: "
+                            "nwritten(%d) != writelen(%d)\n", nwritten, cur_buflen);
+                ret = -1;
+            }
+            cur_buflen = 0;
+            cur_bufptr = dump_buffer;
+        }
+        if (ret == 0) {
+            snprintf(cur_bufptr, summary_length, "DUMP SUMMARY: "
+                     "{ prefix=%s, count=%"PRIu64", total=%"PRIu64" elapsed=%"PRIu64" }\n",
+                     dumper->nprefix > 0 ? dumper->prefix : (dumper->nprefix == 0 ? "<null>" : "<all>"),
+                     dumper->dumpped, dumper->visited, (uint64_t)(time(NULL)-dumper->started));
+            cur_buflen += strlen(cur_bufptr);
+            nwritten = write(fd, dump_buffer, cur_buflen);
+            if (nwritten != cur_buflen) {
+                logger->log(EXTENSION_LOG_WARNING, NULL, "Failed to write the dump: "
+                            "nwritten(%d) != writelen(%d)\n", nwritten, cur_buflen);
+                ret = -1;
+            }
+        }
+    }
+    close(fd);
+
+done:
+    dumper->success = (ret == 0 ? true : false);
+    pthread_mutex_lock(&dumper->lock);
+    dumper->stopped = time(NULL);
+    dumper->running = false;
+    pthread_mutex_unlock(&dumper->lock);
+    return NULL;
+}
+
+static ENGINE_ERROR_CODE do_item_dump_start(struct default_engine *engine,
+                                            enum dump_mode mode,
+                                            const char *prefix, const int nprefix,
+                                            const char *filepath)
+{
+    ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
+    pthread_t tid;
+    pthread_attr_t attr;
+    int fd;
+
+    assert(mode == DUMP_MODE_KEY);
+
+    do {
+        if (engine->dumper.running) {
+            logger->log(EXTENSION_LOG_INFO, NULL,
+                        "Failed to start dumping. Already started.\n");
+            ret = ENGINE_FAILED; break;
+        }
+
+        snprintf(engine->dumper.filepath, MAX_FILEPATH_LENGTH-1, "%s",
+                (filepath != NULL ? filepath : "keydump"));
+        engine->dumper.prefix = (char*)prefix;
+        engine->dumper.nprefix = nprefix;
+        engine->dumper.mode = mode;
+        engine->dumper.started = time(NULL);
+        engine->dumper.stopped = 0;
+        engine->dumper.visited = 0;
+        engine->dumper.dumpped = 0;
+        engine->dumper.success = false;
+        engine->dumper.stop    = false;
+
+        /* check if filepath is valid ? */
+        fd = open(engine->dumper.filepath, O_WRONLY | O_CREAT | O_TRUNC,
+                                           S_IRUSR | S_IWUSR | S_IRGRP);
+        if (fd < 0) {
+            logger->log(EXTENSION_LOG_INFO, NULL,
+                        "Failed to open the dump file. path=%s err=%s\n",
+                        engine->dumper.filepath, strerror(errno));
+            ret = ENGINE_FAILED; break;
+        }
+        close(fd);
+
+        engine->dumper.running = true;
+
+        if (pthread_attr_init(&attr) != 0 ||
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0 ||
+            pthread_create(&tid, &attr, item_dumper_main, engine) != 0)
+        {
+            logger->log(EXTENSION_LOG_INFO, NULL,
+                        "Failed to create the dump thread. err=%s\n", strerror(errno));
+            engine->dumper.running = false;
+            ret = ENGINE_FAILED; break;
+        }
+    } while(0);
+
+    return ret;
+}
+
+static void do_item_dump_stop(struct default_engine *engine)
+{
+    if (engine->dumper.running) {
+        /* stop the dumper */
+        engine->dumper.stop = true;
+    }
+}
+
+ENGINE_ERROR_CODE item_dump(struct default_engine *engine,
+                            enum dump_op op, enum dump_mode mode,
+                            const char *prefix, const int nprefix,
+                            const char *filepath)
+{
+    assert(op == DUMP_OP_START || op == DUMP_OP_STOP);
+    ENGINE_ERROR_CODE ret = ENGINE_SUCCESS;
+
+    pthread_mutex_lock(&engine->dumper.lock);
+    if (op == DUMP_OP_START) {
+        ret = do_item_dump_start(engine, mode, prefix, nprefix, filepath);
+    } else { /* DUMP_OP_STOP */
+        do_item_dump_stop(engine);
+    }
+    pthread_mutex_unlock(&engine->dumper.lock);
+    return ret;
+}
+
+void item_stats_dump(struct default_engine *engine,
+                     ADD_STAT add_stat, const void *cookie)
+{
+    char val[256];
+    int len;
+
+    pthread_mutex_lock(&engine->dumper.lock);
+    if (engine->dumper.running) {
+        add_stat("dumper:status", 13, "running", 7, cookie);
+    } else {
+        add_stat("dumper:status", 13, "stopped", 7, cookie);
+        if (engine->dumper.success)
+            add_stat("dumper:success", 14, "true", 4, cookie);
+        else
+            add_stat("dumper:success", 14, "false", 5, cookie);
+    }
+    if (engine->dumper.started != 0) {
+        if (engine->dumper.mode == DUMP_MODE_KEY) {
+            add_stat("dumper:mode", 11, "key", 3, cookie);
+        } else if (engine->dumper.mode == DUMP_MODE_ITEM) {
+            add_stat("dumper:mode", 11, "item", 4, cookie);
+        } else {
+            add_stat("dumper:mode", 11, "none", 4, cookie);
+        }
+        if (engine->dumper.stopped != 0) {
+            time_t diff = engine->dumper.stopped - engine->dumper.started;
+            len = sprintf(val, "%"PRIu64, (uint64_t)diff);
+            add_stat("dumper:last_run", 15, val, len, cookie);
+        }
+        len = sprintf(val, "%"PRIu64, engine->dumper.visited);
+        add_stat("dumper:visited", 14, val, len, cookie);
+        len = sprintf(val, "%"PRIu64, engine->dumper.dumpped);
+        add_stat("dumper:dumped", 13, val, len, cookie);
+        if (engine->dumper.nprefix > 0) {
+            len = sprintf(val, "%s", engine->dumper.prefix);
+            add_stat("dumper:prefix", 13, val, len, cookie);
+        } else if (engine->dumper.nprefix == 0) {
+            add_stat("dumper:prefix", 13, "<null>", 6, cookie);
+        } else {
+            add_stat("dumper:prefix", 13, "<all>", 5, cookie);
+        }
+        if (strlen(engine->dumper.filepath) > 0) {
+            len = sprintf(val, "%s", engine->dumper.filepath);
+            add_stat("dumper:filepath", 15, val, len, cookie);
+        }
+    }
+    pthread_mutex_unlock(&engine->dumper.lock);
+}
+#endif

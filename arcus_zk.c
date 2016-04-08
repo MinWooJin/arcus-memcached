@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -107,6 +108,8 @@
 #define HEART_BEAT_DFT_TIMEOUT  10000 /* msec */
 #define HEART_BEAT_MAX_TIMEOUT  HEART_BEAT_MAX_FAILSTOP /* msec */
 
+#define MAX_SERVICECODE_LENGTH  32
+
 static const char *zk_root = NULL;
 static const char *zk_map_path   = "cache_server_mapping";
 static const char *zk_log_path   = "cache_server_log";
@@ -121,7 +124,7 @@ static int          last_rc=ZOK;
 // during ZK initialization
 // ZK shutdown is done at the end of arcus_zk_init()
 // to simplify synchronization
-volatile sig_atomic_t  arcus_zk_shutdown=false;
+volatile sig_atomic_t  arcus_zk_shutdown=0;
 // This flag is now used to indicate graceful shutdown.  See hb_thread for
 // more comment.
 
@@ -202,7 +205,7 @@ static pthread_mutex_t azk_mtx  = PTHREAD_MUTEX_INITIALIZER;
 static int             azk_count;
 
 // zookeeper close synchronization
-static pthread_mutex_t zk_close_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t zk_final_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile bool   zk_watcher_running = false;
 
 // memcached heartheat thread */
@@ -516,7 +519,7 @@ mc_hb(zhandle_t *zh, void *context)
     // error during send()/recv(), it may not be a memcached failure at all.
     // We may get slab memory shortage for slab class 0 for above key.
     // For now, we simply return here without ping error or intentional delay
-    err = send(sock, mc_hb_cmd, 29, 0);
+    err = send(sock, mc_hb_cmd, 28, 0);
     if (err > 0) {
         // expects "STORED\r\n"
         err = recv(sock, buf, 8, 0);
@@ -531,8 +534,7 @@ mc_hb(zhandle_t *zh, void *context)
         }
     }
 
-    if (sock)
-        close(sock);
+    close(sock);
     return 0;
 }
 
@@ -571,7 +573,7 @@ hb_thread(void *arg)
      * The user wants a graceful shutdown.  The main thread wakes up all
      * the worker threads and wait for them to terminate.  It also calls
      * the engine destroy function.  In this case, heartbeat should just stop.
-     * arcus_zk_shutdown = true indicates this case.  So, we check that flag
+     * arcus_zk_shutdown = 1 indicates this case.  So, we check that flag
      * in this function.
      *
      * 2. kill -KILL
@@ -599,9 +601,9 @@ hb_thread(void *arg)
             /* sleep with spurious wakeups checking */
             while (tv.tv_sec < ts.tv_sec && !arcus_zk_shutdown) {
                 pthread_mutex_lock(&hb_thread_lock);
-                hb_thread_sleep = false;
-                pthread_cond_timedwait(&hb_thread_cond, &hb_thread_lock, &ts);
                 hb_thread_sleep = true;
+                pthread_cond_timedwait(&hb_thread_cond, &hb_thread_lock, &ts);
+                hb_thread_sleep = false;
                 pthread_mutex_unlock(&hb_thread_lock);
                 gettimeofday(&tv, NULL);
             }
@@ -693,7 +695,7 @@ hb_thread(void *arg)
     }
     hb_thread_running = false;
     if (shutdown_by_me) {
-        arcus_zk_shutdown = true;
+        arcus_zk_shutdown = 1;
         arcus_zk_final("Heartbeat failure");
         exit(0);
     }
@@ -1063,6 +1065,11 @@ void arcus_zk_init(char *ensemble_list, int zk_to,
         arcus_exit(zh, EX_PROTOCOL);
     }
     assert(arcus_conf.svc != NULL);
+    if (strlen(arcus_conf.svc) > MAX_SERVICECODE_LENGTH) {
+        arcus_conf.logger->log(EXTENSION_LOG_WARNING, NULL,
+                 "Too long service code. servicecode=%s\n", arcus_conf.svc);
+        arcus_exit(zh, EX_PROTOCOL);
+    }
 
     snprintf(zpath, sizeof(zpath), "%s/%s/%s", zk_root, zk_cache_path, arcus_conf.svc);
     arcus_conf.cluster_path = strdup(zpath);
@@ -1094,10 +1101,9 @@ void arcus_zk_init(char *ensemble_list, int zk_to,
             "ZooKeeper session timeout: %d sec\n", zoo_recv_timeout(zh)/1000);
 
 #ifdef ENABLE_CLUSTER_AWARE
-    arcus_conf.ch = cluster_config_init(arcus_conf.logger, arcus_conf.verbose);
+    arcus_conf.ch = cluster_config_init(arcus_conf.mc_ipport, strlen(arcus_conf.mc_ipport),
+                                        arcus_conf.logger, arcus_conf.verbose);
     assert(arcus_conf.ch);
-    cluster_config_set_hostport(arcus_conf.ch,
-                                arcus_conf.mc_ipport, strlen(arcus_conf.mc_ipport));
 
     // set a watch to the cache list this memcached belongs in
     // (e.g. /arcus/cache_list/a_cluster)
@@ -1110,7 +1116,7 @@ void arcus_zk_init(char *ensemble_list, int zk_to,
     // start heartbeat thread
     if (start_hb_thread(ping_data) != 0) {
         /* We need normal shutdown at this time */
-        arcus_zk_shutdown = true;
+        arcus_zk_shutdown = 1;
     }
 
     // Either got SIG* or memcached shutdown process finished
@@ -1125,12 +1131,11 @@ void arcus_zk_init(char *ensemble_list, int zk_to,
  */
 void arcus_zk_final(const char *msg)
 {
+    assert(arcus_zk_shutdown == 1);
     arcus_conf.logger->log(EXTENSION_LOG_INFO, NULL,
-                           "Arcus memcached shutting down - %s\n", msg);
+                           "arcus zk final - %s\n", msg);
 
-    assert(arcus_zk_shutdown == true);
-
-    pthread_mutex_lock(&zk_close_lock);
+    pthread_mutex_lock(&zk_final_lock);
     if (zh) {
         int elapsed_msec;
 
@@ -1179,7 +1184,7 @@ void arcus_zk_final(const char *msg)
         zh = NULL;
         arcus_conf.logger->log(EXTENSION_LOG_WARNING, NULL, "zk connection closed\n");
     }
-    pthread_mutex_unlock(&zk_close_lock);
+    pthread_mutex_unlock(&zk_final_lock);
 }
 
 int arcus_zk_set_ensemble(char *ensemble_list)
@@ -1286,26 +1291,39 @@ void arcus_zk_get_stats(arcus_zk_stats *stats)
 }
 
 #ifdef ENABLE_CLUSTER_AWARE
-bool arcus_cluster_is_valid()
+int arcus_key_is_mine(const char *key, size_t nkey, bool *mine)
 {
-    return cluster_config_is_valid(arcus_conf.ch);
-}
-
-bool arcus_key_is_mine(const char *key, size_t nkey)
-{
-    bool key_is_mine;
+    int      ret;
     uint32_t key_id, self_id;
 
-    key_is_mine = cluster_config_key_is_mine(arcus_conf.ch, key, nkey,
-                                             &key_id, &self_id);
-
-    if (arcus_conf.verbose > 2) {
-        arcus_conf.logger->log(EXTENSION_LOG_DEBUG, NULL,
-                "key=%s, self_id=%d, key_id=%d, key_is_mine=%s\n",
-                key, self_id, key_id, (key_is_mine)?"true":"false");
+    ret = cluster_config_key_is_mine(arcus_conf.ch, key, nkey, mine,
+                                     &key_id, &self_id);
+    if (ret == 0) {
+        if (arcus_conf.verbose > 2) {
+            arcus_conf.logger->log(EXTENSION_LOG_DEBUG, NULL,
+                    "key=%s, self_id=%d, key_id=%d, mine=%s\n",
+                    key, self_id, key_id, ((*mine) ? "true" : "false"));
+        }
     }
-    return key_is_mine;
+    return ret;
 }
+
+uint32_t arcus_gen_ketama_hash(const char *key, size_t nkey)
+{
+    return cluster_config_ketama_hash(arcus_conf.ch, key, nkey);
+}
+
+uint32_t arcus_find_hslice_index(uint32_t hvalue)
+{
+    return cluster_config_hslice_index(arcus_conf.ch, hvalue);
+}
+
+/**** OLD CODE ****
+uint32_t arcus_gen_ketama_hash(const char *key, size_t nkey, int *hashidx)
+{
+    return cluster_config_ketama_hash(arcus_conf.ch, key, nkey, hashidx);
+}
+******************/
 #endif
 
 #endif  // ENABLE_ZK_INTEGRATION

@@ -1,6 +1,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,45 +44,66 @@ struct _prefix_t {
     prefix_t *parent_prefix;
 };
 
-struct assoc {
-   /* how many powers of 2's worth of buckets we use */
-   unsigned int hashpower;
+struct bucket_info {
+    uint16_t refcount; /* reference count */
+    uint16_t curpower; /* current hash power:
+                        * how may hash tables each hash bucket use ? (power of 2)
+                        */
+};
 
-   /* Main hash table. This is where we look except during expansion. */
-   hash_item** primary_hashtable;
+struct assoc {
+   uint32_t hashpower; /* how many hash buckets in a hash table ? (power of 2) */
+   uint32_t hashsize;  /* hash table size */
+   uint32_t hashmask;  /* hash bucket mask */
+   uint32_t rootpower; /* how many hash tables we use ? (power of 2) */
+
+   /* cache item hash table : an array of hash tables */
+   struct table {
+      hash_item** hashtable;
+   } *roottable;
+
+   /* bucket info table */
+  struct bucket_info *infotable;
+
+   /* prefix hash table : single hash table */
    prefix_t**  prefix_hashtable;
    prefix_t    noprefix_stats;
-
-   /*
-    * Previous hash table. During expansion, we look here for keys that haven't
-    * been moved over to the primary yet.
-    */
-   hash_item** old_hashtable;
 
    /* Number of items in the hash table. */
    unsigned int hash_items;
    unsigned int tot_prefix_items;
-
-   /* Flag: Are we in the middle of expanding now? */
-   bool expanding;
-
-   /*
-    * During expansion we migrate values with bucket granularity; this is how
-    * far we've gotten so far. Ranges from 0 .. hashsize(hashpower - 1) - 1.
-    */
-   unsigned int expand_bucket;
 };
+
+#ifdef JHPARK_KEY_DUMP
+#define MAX_SCAN_ITEMS 256
+struct assoc_scan {
+  int        guard_data;
+  int        cur_bucket;
+  int        cur_tabidx;
+  int        max_bucket;
+  int        array_size;
+  int        item_count;
+  hash_item *item_array[MAX_SCAN_ITEMS];
+};
+#endif
 
 /* associative array */
 ENGINE_ERROR_CODE assoc_init(struct default_engine *engine);
-hash_item *       assoc_find(struct default_engine *engine,
-                             uint32_t hash, const char *key, const size_t nkey);
-int               assoc_insert(struct default_engine *engine,
-                               uint32_t hash, hash_item *item);
-void              assoc_delete(struct default_engine *engine,
-                               uint32_t hash, const char *key, const size_t nkey);
-prefix_t *        assoc_prefix_find(struct default_engine *engine,
-                                    uint32_t hash, const char *prefix, const size_t nprefix);
+void              assoc_final(struct default_engine *engine);
+
+hash_item *       assoc_find(struct default_engine *engine, uint32_t hash,
+                             const char *key, const size_t nkey);
+int               assoc_insert(struct default_engine *engine, uint32_t hash, hash_item *item);
+void              assoc_delete(struct default_engine *engine, uint32_t hash,
+                               const char *key, const size_t nkey);
+#ifdef JHPARK_KEY_DUMP
+/* assoc scan functions */
+void              assoc_scan_init(struct default_engine *engine, struct assoc_scan *scan);
+void              assoc_scan_next(struct default_engine *engine, struct assoc_scan *scan);
+void              assoc_scan_final(struct default_engine *engine, struct assoc_scan *scan);
+#endif
+prefix_t *        assoc_prefix_find(struct default_engine *engine, uint32_t hash,
+                                    const char *prefix, const size_t nprefix);
 bool              assoc_prefix_isvalid(struct default_engine *engine, hash_item *it);
 void              assoc_prefix_update_size(prefix_t *pt, ENGINE_ITEM_TYPE item_type,
                                     const size_t item_size, const bool increment);

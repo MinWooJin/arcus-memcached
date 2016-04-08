@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -370,8 +371,10 @@ extern "C" {
                                                 uint16_t vbucket);
         ENGINE_ERROR_CODE (*list_elem_alloc)(ENGINE_HANDLE* handle,
                                              const void* cookie,
-                                             eitem** eitem,
-                                             const size_t nbytes);
+                                             const void* key,
+                                             const int nkey,
+                                             const size_t nbytes,
+                                             eitem** eitem);
         void (*list_elem_release)(ENGINE_HANDLE* handle,
                                   const void *cookie,
                                   eitem **eitem_array,
@@ -419,8 +422,10 @@ extern "C" {
                                                uint16_t vbucket);
         ENGINE_ERROR_CODE (*set_elem_alloc)(ENGINE_HANDLE* handle,
                                             const void* cookie,
-                                            eitem** eitem,
-                                            const size_t nbytes);
+                                            const void* key,
+                                            const int nkey,
+                                            const size_t nbytes,
+                                            eitem** eitem);
         void (*set_elem_release)(ENGINE_HANDLE* handle,
                                  const void *cookie,
                                  eitem **eitem_array,
@@ -473,10 +478,12 @@ extern "C" {
                                                  uint16_t vbucket);
         ENGINE_ERROR_CODE (*btree_elem_alloc)(ENGINE_HANDLE* handle,
                                               const void* cookie,
-                                              eitem** eitem,
+                                              const void* key,
+                                              const int nkey,
                                               const size_t nbkey,
                                               const size_t neflag,
-                                              const size_t nbytes);
+                                              const size_t nbytes,
+                                              eitem** eitem);
         void (*btree_elem_release)(ENGINE_HANDLE* handle,
                                    const void *cookie,
                                    eitem **eitem_array,
@@ -510,6 +517,7 @@ extern "C" {
                                               const uint32_t req_count,
                                               const bool drop_if_empty,
                                               uint32_t* del_count,
+                                              uint32_t* access_count,
                                               bool* dropped,
                                               uint16_t vbucket);
         ENGINE_ERROR_CODE (*btree_elem_arithmetic)(ENGINE_HANDLE* handle,
@@ -536,6 +544,7 @@ extern "C" {
                                             const bool drop_if_empty,
                                             eitem** eitem_array,
                                             uint32_t* eitem_count,
+                                            uint32_t* access_count,
                                             uint32_t* flags,
                                             bool* dropped_trimmed,
                                             uint16_t vbucket);
@@ -546,7 +555,7 @@ extern "C" {
                                               const bkey_range *bkrange,
                                               const eflag_filter *efilter,
                                               uint32_t* eitem_count,
-                                              uint32_t* flags,
+                                              uint32_t* access_count,
                                               uint16_t vbucket);
         ENGINE_ERROR_CODE (*btree_posi_find)(ENGINE_HANDLE *handle,
                                              const void* cookie,
@@ -581,7 +590,8 @@ extern "C" {
                                              uint32_t *flags,
                                              uint16_t vbucket);
 #ifdef SUPPORT_BOP_SMGET
-        ENGINE_ERROR_CODE (*btree_elem_smget)(ENGINE_HANDLE* handle,
+#if 1 // JHPARK_OLD_SMGET_INTERFACE
+        ENGINE_ERROR_CODE (*btree_elem_smget_old)(ENGINE_HANDLE* handle,
                                               const void* cookie,
                                               token_t *karray,
                                               const int kcount,
@@ -597,6 +607,30 @@ extern "C" {
                                               uint32_t* missed_key_count,
                                               bool *trimmed,
                                               bool *duplicated,
+                                              uint16_t vbucket);
+#endif
+
+        ENGINE_ERROR_CODE (*btree_elem_smget)(ENGINE_HANDLE* handle,
+                                              const void* cookie,
+                                              token_t *karray,
+                                              const int kcount,
+                                              const bkey_range *bkrange,
+                                              const eflag_filter *efilter,
+                                              const uint32_t offset,
+                                              const uint32_t count,
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+                                              const bool unique,
+                                              smget_result_t *result,
+#else
+                                              eitem** eitem_array,
+                                              uint32_t* kfnd_array,
+                                              uint32_t* flag_array,
+                                              uint32_t* eitem_count,
+                                              uint32_t* missed_key_array,
+                                              uint32_t* missed_key_count,
+                                              bool *trimmed,
+                                              bool *duplicated,
+#endif
                                               uint16_t vbucket);
 #endif
         /*
@@ -675,6 +709,12 @@ extern "C" {
                                           const void *cookie,
                                           const size_t memlimit,
                                           const int sticky_ratio);
+#ifdef CONFIG_MAX_COLLECTION_SIZE
+        ENGINE_ERROR_CODE (*set_maxcollsize)(ENGINE_HANDLE* handle,
+                                          const void *cookie,
+                                          const int coll_type,
+                                          int *maxsize);
+#endif
 
         void (*set_verbose) (ENGINE_HANDLE* handle,
                              const void* cookie,
@@ -687,6 +727,14 @@ extern "C" {
                           const bool forward,
                           const bool sticky,
                           unsigned int *bytes);
+#ifdef JHPARK_KEY_DUMP
+        ENGINE_ERROR_CODE (*dump)(ENGINE_HANDLE* handle,
+                                  const void *cookie,
+                                  const char *opstr,
+                                  const char *modestr,
+                                  const char *prefix, const int nprefix,
+                                  const char *filepath);
+#endif
 
         /**
          * Any unknown command will be considered engine specific.

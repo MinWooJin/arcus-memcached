@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +30,9 @@
 #define hashsize(n) ((uint32_t)1<<(n))
 #define hashmask(n) (hashsize(n)-1)
 
+#define GET_HASH_BUCKET(hash, mask)        ((hash) & (mask))
+#define GET_HASH_TABIDX(hash, shift, mask) (((hash) >> (shift)) & (mask))
+
 #define DEFAULT_PREFIX_HASHPOWER 10
 #define DEFAULT_PREFIX_MAX_DEPTH 1
 
@@ -38,7 +42,9 @@ typedef struct {
     uint32_t    hash;
 } prefix_t_list_elem;
 
-static prefix_t *root_pt = NULL;
+static EXTENSION_LOGGER_DESCRIPTOR *logger;
+static prefix_t *root_pt = NULL; /* root prefix info */
+
 
 static inline void *_get_prefix(prefix_t *prefix)
 {
@@ -47,37 +53,93 @@ static inline void *_get_prefix(prefix_t *prefix)
 
 ENGINE_ERROR_CODE assoc_init(struct default_engine *engine)
 {
-    engine->assoc.primary_hashtable = calloc(hashsize(engine->assoc.hashpower), sizeof(void *));
-    if (engine->assoc.primary_hashtable == NULL) {
+    struct assoc *assoc = &engine->assoc;
+
+    logger = engine->server.log->get_logger();
+
+    assoc->hashsize = hashsize(assoc->hashpower);
+    assoc->hashmask = hashmask(assoc->hashpower);
+    assoc->rootpower = 0;
+
+    assoc->roottable = calloc(assoc->hashsize * 2, sizeof(void *));
+    if (assoc->roottable == NULL) {
         return ENGINE_ENOMEM;
     }
-    engine->assoc.prefix_hashtable = calloc(hashsize(DEFAULT_PREFIX_HASHPOWER), sizeof(void *));
-    if (engine->assoc.prefix_hashtable == NULL) {
-        free(engine->assoc.primary_hashtable);
-        engine->assoc.primary_hashtable = NULL;
+    assoc->roottable[0].hashtable = (hash_item**)&assoc->roottable[assoc->hashsize];
+
+    assoc->infotable = calloc(assoc->hashsize, sizeof(struct bucket_info));
+    if (assoc->infotable == NULL) {
+        free(assoc->roottable);
         return ENGINE_ENOMEM;
     }
+
+    assoc->prefix_hashtable = calloc(hashsize(DEFAULT_PREFIX_HASHPOWER), sizeof(void *));
+    if (assoc->prefix_hashtable == NULL) {
+        free(assoc->roottable);
+        free(assoc->infotable);
+        return ENGINE_ENOMEM;
+    }
+
     // initialize noprefix stats info
-    memset(&engine->assoc.noprefix_stats, 0, sizeof(prefix_t));
-    root_pt = &engine->assoc.noprefix_stats;
+    memset(&assoc->noprefix_stats, 0, sizeof(prefix_t));
+    root_pt = &assoc->noprefix_stats;
+
+    logger->log(EXTENSION_LOG_INFO, NULL, "ASSOC module initialized.\n");
     return ENGINE_SUCCESS;
 }
 
-hash_item *assoc_find(struct default_engine *engine, uint32_t hash, const char *key, const size_t nkey)
+void assoc_final(struct default_engine *engine)
 {
-    hash_item *it;
-    unsigned int oldbucket;
+    struct assoc *assoc = &engine->assoc;
+    int ii, table_count;
 
-    if (engine->assoc.expanding &&
-        (oldbucket = (hash & hashmask(engine->assoc.hashpower - 1))) >= engine->assoc.expand_bucket)
-    {
-        it = engine->assoc.old_hashtable[oldbucket];
-    } else {
-        it = engine->assoc.primary_hashtable[hash & hashmask(engine->assoc.hashpower)];
+    for (ii=0; ii < assoc->rootpower; ++ii) {
+         table_count = hashsize(ii); //2 ^ n
+         free(assoc->roottable[table_count].hashtable);
     }
+    free(assoc->roottable);
+    free(assoc->infotable);
+    free(assoc->prefix_hashtable);
+    logger->log(EXTENSION_LOG_INFO, NULL, "ASSOC module destroyed.\n");
+}
 
+static void redistribute(struct default_engine *engine, unsigned int bucket)
+{
+    struct assoc *assoc = &engine->assoc;
+    hash_item *it, **prev;
+    uint32_t tabidx;
+    uint32_t ii, table_count = hashsize(assoc->infotable[bucket].curpower);
+
+    for (ii=0; ii < table_count; ++ii) {
+         prev = &assoc->roottable[ii].hashtable[bucket];
+         while (*prev != NULL) {
+             it = *prev;
+             tabidx = GET_HASH_TABIDX(engine->server.core->hash(item_get_key(it), it->nkey, 0),
+                                      assoc->hashpower, hashmask(assoc->rootpower));
+             if (tabidx == ii) {
+                 prev = &it->h_next;
+             } else {
+                 *prev = it->h_next;
+                 it->h_next = assoc->roottable[tabidx].hashtable[bucket];
+                 assoc->roottable[tabidx].hashtable[bucket] = it;
+             }
+         }
+    }
+    assoc->infotable[bucket].curpower = assoc->rootpower;
+}
+
+hash_item *assoc_find(struct default_engine *engine, uint32_t hash,
+                      const char *key, const size_t nkey)
+{
+    struct assoc *assoc = &engine->assoc;
     hash_item *ret = NULL;
+    hash_item *it;
     int depth = 0;
+    uint32_t bucket = GET_HASH_BUCKET(hash, assoc->hashmask);
+    uint32_t tabidx = GET_HASH_TABIDX(hash, assoc->hashpower,
+                                      hashmask(assoc->infotable[bucket].curpower));
+
+    it = assoc->roottable[tabidx].hashtable[bucket];
     while (it) {
         if ((nkey == it->nkey) && (memcmp(key, item_get_key(it), nkey) == 0)) {
             ret = it;
@@ -86,155 +148,74 @@ hash_item *assoc_find(struct default_engine *engine, uint32_t hash, const char *
         it = it->h_next;
         ++depth;
     }
-
     MEMCACHED_ASSOC_FIND(key, nkey, depth);
     return ret;
 }
 
 /* returns the address of the item pointer before the key.  if *item == 0,
    the item wasn't found */
-static hash_item** _hashitem_before(struct default_engine *engine,
-                                    uint32_t hash, const char *key, const size_t nkey)
+static hash_item** _hashitem_before(struct default_engine *engine, uint32_t hash,
+                                    const char *key, const size_t nkey)
 {
+    struct assoc *assoc = &engine->assoc;
     hash_item **pos;
-    unsigned int oldbucket;
+    uint32_t bucket = GET_HASH_BUCKET(hash, assoc->hashmask);
+    uint32_t tabidx = GET_HASH_TABIDX(hash, assoc->hashpower,
+                                      hashmask(assoc->infotable[bucket].curpower));
 
-    if (engine->assoc.expanding &&
-        (oldbucket = (hash & hashmask(engine->assoc.hashpower - 1))) >= engine->assoc.expand_bucket)
-    {
-        pos = &engine->assoc.old_hashtable[oldbucket];
-    } else {
-        pos = &engine->assoc.primary_hashtable[hash & hashmask(engine->assoc.hashpower)];
-    }
-
+    pos = &assoc->roottable[tabidx].hashtable[bucket];
     while (*pos && ((nkey != (*pos)->nkey) || memcmp(key, item_get_key(*pos), nkey))) {
         pos = &(*pos)->h_next;
     }
     return pos;
 }
 
-#define DEFAULT_HASH_BULK_MOVE 10
-int hash_bulk_move = DEFAULT_HASH_BULK_MOVE;
-
-static void *assoc_maintenance_thread(void *arg)
-{
-    struct default_engine *engine = arg;
-    bool done = false;
-    struct timespec sleep_time = {0, 1000};
-    int  i,try_cnt = 9;
-    long tot_execs = 0;
-    EXTENSION_LOGGER_DESCRIPTOR *logger = engine->server.log->get_logger();
-    if (engine->config.verbose) {
-        logger->log(EXTENSION_LOG_INFO, NULL, "Hash table expansion start: %d => %d\n",
-                    hashsize(engine->assoc.hashpower - 1), hashsize(engine->assoc.hashpower));
-    }
-
-    do {
-        int ii;
-        /* long-running background task.
-         * hold the cache lock lazily in order to give priority to normal workers.
-         */
-        for (i = 0; i < try_cnt; i++) {
-            if (pthread_mutex_trylock(&engine->cache_lock) == 0) break;
-            nanosleep(&sleep_time, NULL);
-        }
-        if (i == try_cnt) pthread_mutex_lock(&engine->cache_lock);
-        for (ii = 0; ii < hash_bulk_move && engine->assoc.expanding; ++ii) {
-            hash_item *it, *next;
-            int bucket;
-
-            for (it = engine->assoc.old_hashtable[engine->assoc.expand_bucket];
-                 NULL != it; it = next) {
-                next = it->h_next;
-
-                bucket = engine->server.core->hash(item_get_key(it), it->nkey, 0)
-                    & hashmask(engine->assoc.hashpower);
-                it->h_next = engine->assoc.primary_hashtable[bucket];
-                engine->assoc.primary_hashtable[bucket] = it;
-            }
-
-            engine->assoc.old_hashtable[engine->assoc.expand_bucket] = NULL;
-            engine->assoc.expand_bucket++;
-            if (engine->assoc.expand_bucket == hashsize(engine->assoc.hashpower - 1)) {
-                engine->assoc.expanding = false;
-                free(engine->assoc.old_hashtable);
-            }
-        }
-        if (!engine->assoc.expanding) {
-            done = true;
-        }
-        pthread_mutex_unlock(&engine->cache_lock);
-        if ((++tot_execs % 100) == 0) {
-            nanosleep(&sleep_time, NULL);
-        }
-    } while (!done);
-
-    if (engine->config.verbose) {
-        logger->log(EXTENSION_LOG_INFO, NULL, "Hash table expansion done\n");
-    }
-    return NULL;
-}
-
 /* grows the hashtable to the next power of 2. */
 static void assoc_expand(struct default_engine *engine)
 {
-    engine->assoc.old_hashtable = engine->assoc.primary_hashtable;
+    struct assoc *assoc = &engine->assoc;
+    hash_item** new_hashtable;
+    uint32_t ii, table_count = hashsize(assoc->rootpower); // 2 ^ n
 
-    engine->assoc.primary_hashtable = calloc(hashsize(engine->assoc.hashpower + 1), sizeof(void *));
-    if (engine->assoc.primary_hashtable) {
-        engine->assoc.hashpower++;
-        engine->assoc.expanding = true;
-        engine->assoc.expand_bucket = 0;
-
-        /* start a thread to do the expansion */
-        int ret = 0;
-        pthread_t tid;
-        pthread_attr_t attr;
-
-        if (pthread_attr_init(&attr) != 0 ||
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) != 0 ||
-            (ret = pthread_create(&tid, &attr, assoc_maintenance_thread, engine)) != 0)
-        {
-            fprintf(stderr, "Can't create thread: %s\n", strerror(ret));
-            engine->assoc.hashpower--;
-            engine->assoc.expanding = false;
-            free(engine->assoc.primary_hashtable);
-            engine->assoc.primary_hashtable =engine->assoc.old_hashtable;
+    new_hashtable = calloc(assoc->hashsize * table_count, sizeof(void *));
+    if (new_hashtable) {
+        for (ii=0; ii < table_count; ++ii) {
+            assoc->roottable[table_count+ii].hashtable = &new_hashtable[assoc->hashsize*ii];
         }
-    } else {
-        engine->assoc.primary_hashtable = engine->assoc.old_hashtable;
-        /* Bad news, but we can keep running. */
+        assoc->rootpower++;
     }
 }
 
 /* Note: this isn't an assoc_update.  The key must not already exist to call this */
 int assoc_insert(struct default_engine *engine, uint32_t hash, hash_item *it)
 {
-    unsigned int oldbucket;
+    struct assoc *assoc = &engine->assoc;
+    uint32_t bucket = GET_HASH_BUCKET(hash, assoc->hashmask);
+    uint32_t tabidx;
 
-    assert(assoc_find(engine, hash, item_get_key(it), it->nkey) == 0);  /* shouldn't have duplicately named things defined */
+    assert(assoc_find(engine, hash, item_get_key(it), it->nkey) == 0); /* shouldn't have duplicately named things defined */
+
+    if (assoc->infotable[bucket].curpower != assoc->rootpower &&
+        assoc->infotable[bucket].refcount == 0) {
+        redistribute(engine, bucket);
+    }
+    tabidx = GET_HASH_TABIDX(hash, assoc->hashpower,
+                             hashmask(assoc->infotable[bucket].curpower));
 
     // inserting actual hash_item to appropriate assoc_t
-    if (engine->assoc.expanding &&
-            (oldbucket = (hash & hashmask(engine->assoc.hashpower - 1))) >= engine->assoc.expand_bucket)
-    {
-        it->h_next = engine->assoc.old_hashtable[oldbucket];
-        engine->assoc.old_hashtable[oldbucket] = it;
-    } else {
-        it->h_next = engine->assoc.primary_hashtable[hash & hashmask(engine->assoc.hashpower)];
-        engine->assoc.primary_hashtable[hash & hashmask(engine->assoc.hashpower)] = it;
-    }
+    it->h_next = assoc->roottable[tabidx].hashtable[bucket];
+    assoc->roottable[tabidx].hashtable[bucket] = it;
 
-    engine->assoc.hash_items++;
-    if (! engine->assoc.expanding && engine->assoc.hash_items > (hashsize(engine->assoc.hashpower) * 3) / 2) {
+    assoc->hash_items++;
+    if (assoc->hash_items > (hashsize(assoc->hashpower + assoc->rootpower) * 3) / 2) {
         assoc_expand(engine);
     }
-
-    MEMCACHED_ASSOC_INSERT(item_get_key(it), it->nkey, engine->assoc.hash_items);
+    MEMCACHED_ASSOC_INSERT(item_get_key(it), it->nkey, assoc->hash_items);
     return 1;
 }
 
-void assoc_delete(struct default_engine *engine, uint32_t hash, const char *key, const size_t nkey)
+void assoc_delete(struct default_engine *engine, uint32_t hash,
+                  const char *key, const size_t nkey)
 {
     hash_item **before = _hashitem_before(engine, hash, key, nkey);
 
@@ -257,10 +238,84 @@ void assoc_delete(struct default_engine *engine, uint32_t hash, const char *key,
     assert(*before != 0);
 }
 
+#ifdef JHPARK_KEY_DUMP
+/*
+ * Assoc scan
+ */
+void assoc_scan_init(struct default_engine *engine, struct assoc_scan *scan)
+{
+    scan->guard_data = 23456;
+    scan->cur_bucket = 0;
+    scan->cur_tabidx = 0;
+    scan->max_bucket = engine->assoc.hashsize;
+    scan->array_size = MAX_SCAN_ITEMS;
+    scan->item_count = 0;
+}
+
+void assoc_scan_next(struct default_engine *engine, struct assoc_scan *scan)
+{
+    assert(scan->guard_data == 23456);
+    struct assoc *assoc = &engine->assoc;
+    hash_item *it;
+    uint32_t ii, ntables;
+    uint32_t found_count;
+    uint32_t access_count = 0;
+
+    scan->item_count = 0;
+    while (scan->cur_bucket < scan->max_bucket) {
+        if (scan->cur_tabidx == 0) {
+            /* increment bucket's reference count */
+            assoc->infotable[scan->cur_bucket].refcount += 1;
+        }
+        ntables = hashsize(assoc->infotable[scan->cur_bucket].curpower);
+        for (ii=scan->cur_tabidx; ii < ntables; ii++) {
+            if (access_count > (MAX_SCAN_ITEMS/2)) {
+                break; /* long time elapsed after holding cache lock */
+            }
+            found_count = 0;
+            it = assoc->roottable[ii].hashtable[scan->cur_bucket];
+            while (it != NULL) {
+                access_count++;
+                if (item_is_valid(engine, it)) {
+                    if ((scan->item_count + found_count) >= scan->array_size) {
+                        break; /* overflow */
+                    }
+                    scan->item_array[scan->item_count + found_count]= it;
+                    found_count += 1;
+                }
+                it = it->h_next;
+            }
+            if (it != NULL) { /* overflow */
+                scan->cur_tabidx = ii;
+                break;
+            }
+            scan->item_count += found_count;
+        }
+        if (ii < ntables) break;
+
+        /* decrement bucket's reference count */
+        assoc->infotable[scan->cur_bucket].refcount -= 1;
+        scan->cur_tabidx = 0;
+        scan->cur_bucket += 1;
+    }
+}
+
+void assoc_scan_final(struct default_engine *engine, struct assoc_scan *scan)
+{
+    assert(scan->guard_data == 23456);
+    if (scan->cur_bucket < scan->max_bucket) {
+        /* decrement bucket's reference count */
+        engine->assoc.infotable[scan->cur_bucket].refcount -= 1;
+    }
+    scan->guard_data = 0;
+}
+#endif
+
 /*
  * Prefix Management
  */
-prefix_t *assoc_prefix_find(struct default_engine *engine, uint32_t hash, const char *prefix, const size_t nprefix)
+prefix_t *assoc_prefix_find(struct default_engine *engine, uint32_t hash,
+                            const char *prefix, const size_t nprefix)
 {
     prefix_t *pt;
 
@@ -274,8 +329,8 @@ prefix_t *assoc_prefix_find(struct default_engine *engine, uint32_t hash, const 
     return NULL;
 }
 
-static prefix_t** _prefixitem_before(struct default_engine *engine,
-                                     uint32_t hash, const char *prefix, const size_t nprefix)
+static prefix_t** _prefixitem_before(struct default_engine *engine, uint32_t hash,
+                                     const char *prefix, const size_t nprefix)
 {
     prefix_t **pos;
 
@@ -299,9 +354,10 @@ static int _prefix_insert(struct default_engine *engine, uint32_t hash, prefix_t
     return 1;
 }
 
-static void _prefix_delete(struct default_engine *engine, uint32_t prefix_hash, const char *prefix, const uint8_t nprefix)
+static void _prefix_delete(struct default_engine *engine, uint32_t hash,
+                           const char *prefix, const uint8_t nprefix)
 {
-    prefix_t **prefix_before = _prefixitem_before(engine, prefix_hash, prefix, nprefix);
+    prefix_t **prefix_before = _prefixitem_before(engine, hash, prefix, nprefix);
     prefix_t *pt = *prefix_before;
     prefix_t *prefix_nxt = NULL;
 
@@ -314,8 +370,7 @@ static void _prefix_delete(struct default_engine *engine, uint32_t prefix_hash, 
     pt->h_next = 0;
     *prefix_before = prefix_nxt;
 
-    // release
-    free(pt);
+    free(pt); // release
 }
 
 bool assoc_prefix_isvalid(struct default_engine *engine, hash_item *it)
@@ -346,7 +401,8 @@ bool assoc_prefix_isvalid(struct default_engine *engine, hash_item *it)
     return true;
 }
 
-void assoc_prefix_update_size(prefix_t *pt, ENGINE_ITEM_TYPE item_type, const size_t item_size, const bool increment)
+void assoc_prefix_update_size(prefix_t *pt, ENGINE_ITEM_TYPE item_type,
+                              const size_t item_size, const bool increment)
 {
     assert(pt != NULL);
 
@@ -382,8 +438,8 @@ void assoc_prefix_update_size(prefix_t *pt, ENGINE_ITEM_TYPE item_type, const si
     }
 }
 
-ENGINE_ERROR_CODE assoc_prefix_link(struct default_engine *engine,
-                                    hash_item *it, const size_t item_size, prefix_t **pfx_item)
+ENGINE_ERROR_CODE assoc_prefix_link(struct default_engine *engine, hash_item *it,
+                                    const size_t item_size, prefix_t **pfx_item)
 {
     assert(it->nprefix == 0);
     const char *key = item_get_key(it);
@@ -395,7 +451,7 @@ ENGINE_ERROR_CODE assoc_prefix_link(struct default_engine *engine,
     prefix_t_list_elem prefix_list[DEFAULT_PREFIX_MAX_DEPTH];
 
     // prefix discovering: we don't even know prefix existence at this time
-    while ((token = memchr(key + i + 1, engine->config.prefix_delimiter, nkey - i - 1)) != NULL) {
+    while ((token = memchr(key+i+1, engine->config.prefix_delimiter, nkey-i-1)) != NULL) {
         i = token - key;
         prefix_list[prefix_depth].nprefix = i;
 
@@ -561,29 +617,34 @@ static uint32_t do_assoc_count_invalid_prefix(struct default_engine *engine)
 }
 #endif
 
-static ENGINE_ERROR_CODE do_assoc_get_prefix_stats(struct default_engine *engine,
-                                                   const char *prefix, const int  nprefix, void *prefix_data)
+static ENGINE_ERROR_CODE
+do_assoc_get_prefix_stats(struct default_engine *engine,
+                          const char *prefix, const int  nprefix,
+                          void *prefix_data)
 {
+    struct assoc *assoc = &engine->assoc;
     prefix_t *pt;
 
     if (nprefix < 0) { // all prefix information
         char *buf;
         struct tm *t;
         const char *format = "PREFIX %s itm %llu kitm %llu litm %llu sitm %llu bitm %llu "
-                             "tsz %llu ktsz %llu ltsz %llu stsz %llu btsz %llu time %04d%02d%02d%02d%02d%02d\r\n";
+                                       "tsz %llu ktsz %llu ltsz %llu stsz %llu btsz %llu "
+                                       "time %04d%02d%02d%02d%02d%02d\r\n";
         uint32_t i, hsize = hashsize(DEFAULT_PREFIX_HASHPOWER);
-        uint32_t num_prefixes = engine->assoc.tot_prefix_items;
+        uint32_t num_prefixes = assoc->tot_prefix_items;
         uint32_t tot_prefix_name_len = 0;
         uint32_t msize, pos, written;
 
         pt = root_pt;
-        if (pt != NULL && (pt->hash_items > 0 || pt->list_hash_items > 0 || pt->set_hash_items > 0 || pt->btree_hash_items > 0)) {
+        if (pt != NULL && (pt->hash_items > 0 || pt->list_hash_items > 0 ||
+                           pt->set_hash_items > 0 || pt->btree_hash_items > 0)) {
             /* including null prefix */
             num_prefixes += 1;
             tot_prefix_name_len = strlen("<null>");
         }
         for (i = 0; i < hsize; i++) {
-            pt = engine->assoc.prefix_hashtable[i];
+            pt = assoc->prefix_hashtable[i];
             while (pt) {
                 tot_prefix_name_len += pt->nprefix;
                 pt = pt->h_next;
@@ -603,7 +664,8 @@ static ENGINE_ERROR_CODE do_assoc_get_prefix_stats(struct default_engine *engine
         pos = sizeof(uint32_t);
 
         pt = root_pt;
-        if (pt != NULL && (pt->hash_items > 0 || pt->list_hash_items > 0 || pt->set_hash_items > 0 || pt->btree_hash_items > 0)) {
+        if (pt != NULL && (pt->hash_items > 0 || pt->list_hash_items > 0 ||
+                           pt->set_hash_items > 0 || pt->btree_hash_items > 0)) {
             /* including null prefix */
             t = localtime(&pt->create_time);
             written = snprintf(buf+pos, msize-pos, format, "<null>",
@@ -616,7 +678,7 @@ static ENGINE_ERROR_CODE do_assoc_get_prefix_stats(struct default_engine *engine
         }
 
         for (i = 0; i < hsize; i++) {
-            pt = engine->assoc.prefix_hashtable[i];
+            pt = assoc->prefix_hashtable[i];
             while (pt) {
                 t = localtime(&pt->create_time);
                 written = snprintf(buf+pos, msize-pos, format, _get_prefix(pt),
@@ -652,7 +714,7 @@ static ENGINE_ERROR_CODE do_assoc_get_prefix_stats(struct default_engine *engine
         if (prefix != NULL)
             prefix_stats->tot_prefix_items = pt->prefix_items;
         else
-            prefix_stats->tot_prefix_items = engine->assoc.tot_prefix_items;
+            prefix_stats->tot_prefix_items = assoc->tot_prefix_items;
     }
     return ENGINE_SUCCESS;
 }

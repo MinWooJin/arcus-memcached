@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2014-2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -860,7 +861,16 @@ ENGINE_ERROR_CODE slabs_init(struct default_engine *engine,
 #endif
 
     do_smmgr_init(engine);
+
+    logger->log(EXTENSION_LOG_INFO, NULL, "SLABS module initialized.\n");
     return ENGINE_SUCCESS;
+}
+
+void slabs_final(struct default_engine *engine)
+{
+    /* Free memory allocated. */
+    /* Do nothing, currently. */
+    logger->log(EXTENSION_LOG_INFO, NULL, "SLABS module destroyed.\n");
 }
 
 #ifndef DONT_PREALLOC_SLABS

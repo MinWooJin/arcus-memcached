@@ -5,6 +5,9 @@ Admin & Monitoring 명령
 - SCRUB 명령
 - STATS 명령
 - CONFIG 명령
+- CMDLOG 명령
+- LQDETECT 명령
+- KEY DUMP 명령
 - HELP 명령
 
 ### Flush 명령
@@ -288,6 +291,191 @@ config maxconns [<maxconn>]\r\n
 
 \<maxconn\>는 새로 지정할 최대 연결 수로서, 현재의 연결 수보다 10% 이상의 큰 값으로만 설정이 가능하다.
 이 인자가 생략되면 현재 설정되어 있는 최대 연결 수 값을 조회한다.
+
+### Command Logging 명령
+
+Arcus cache server에 입력되는 command를 logging 한다.
+start 명령을 시작으로 logging이 종료될 때 까지의 모든 command를 기록한다.
+단, 성능유지를 위해 skip되는 command가 있을 수 있으며 stats 명령을 통해 그 수를 확인할 수 있다.
+10MB log 파일 10개를 사용하며, 초과될 경우 자동 종료한다.
+
+```
+cmdlog [start [<log_file_path>] | stop | stats]\r\n
+```
+
+\<log_file_path\>는 logging 정보를 저장할 file의 path이다.
+- path는 생략 가능하며, 생략할 경우 default로 지정된다.
+  - default로 자동 지정할 경우 log file은 memcached구동위치/command_log 디렉터리 안에 생성된다.
+  - command_log 디렉터리는 자동생성되지 않으며, memcached process가 구동된 위치에 생성해 주어야 한다.
+  - 생성되는 log file의 파일명은 11211_20160126_191445_0.log | port_bgndate_bgntime_{n}.log 이다.
+- path는 직접 지정할 경우 절대 path, 상대 path지정이 가능하다. 최종 파일이 생성될 디렉터리까지 지정해 주어야 한다.
+
+start 명령의 결과로 log file에 출력되는 내용은 아래와 같다.
+
+```
+---------------------------------------
+format : <time> <client_ip> <command>\n
+---------------------------------------
+
+19:14:45.530198 127.0.0.1 bop insert arcustest-Collection_Btree:vuRYyfqyeP0Egg8daGF72 0x626B65795F6279746541727279323239 0x45464C4147 80 create 0 600 4000
+19:14:45.530387 127.0.0.1 lop insert arcustest-Collection_List:pGhEn6DFv5MixbYObBgp1 -1 64 create 0 600 4000
+19:14:45.530221 127.0.0.1 lop insert arcustest-Collection_List:hhSAED2pFBH9xGqEgAeW1 -1 80 create 0 600 4000
+19:14:45.530334 127.0.0.1 bop insert arcustest-Collection_Btree:RGSXLACxWpKwLPdC86qn0 0x626B65795F6279746541727279303331 0x45464C4147 80 create 0 600 4000
+19:14:45.530385 127.0.0.1 lop insert arcustest-Collection_List:PwFTiFSEWlenireHcxNb2 -1 80 create 0 600 4000
+19:14:45.530407 127.0.0.1 bop insert arcustest-Collection_Btree:P1lfJrJyVFyP0ogrw27h1 0x626B65795F6279746541727279313238 0x45464C4147 101 create 0 600 4000
+19:14:45.530537 127.0.0.1 sop exist arcustest-Collection_Set:gTx8KDPBiufiGN9ArtgG3 81 pipe
+19:14:45.530757 127.0.0.1 sop exist arcustest-Collection_Set:gTx8KDPBiufiGN9ArtgG3 81
+```
+
+stop 명령은 logging이 완료되기 전 중지하고 싶을 때 사용할 수 있다.
+
+stats 명령은 가장 최근 수행된(수행 중인) command logging의 상태를 조회하고 결과는 아래와 같다.
+
+```
+Command logging stats
+The last running time : 20160126_192729 ~ 20160126_192742               //bgndate_bgntime ~ enddate_endtime
+The number of entered commands : 146783                                 //entered_commands
+The number of skipped commands : 0                                      //skipped_commands
+The number of log files : 1                                             //file_count
+The log file name: /Users/mwjin/Task/temp/11211_20160126_192729_{n}.log //path/file_name
+How command logging stopped : stop by explicit request                  //stop by explicit request
+                                                                          stop by command log overflow
+                                                                          stop by disk flush error
+```
+
+### Long query detect 명령
+
+Arcus cache server에서 collection item에 대한 요청 중에는 그 처리 시간이 오래 걸리는 요청이 존재한다.
+이를 detect하기 위한 기능으로 lqdetect 명령을 제공한다.
+start 명령을 시작으로 detection이 종료될 때 까지 long query 가능성이 있는 command에 대하여, 
+그 command 처리에서 접근한 elements 수가 특정 기준 이상인 command를 추출,
+command 별로 detect된 명령어 20개를 샘플로 저장한다.
+long query 대상이 되는 모든 command에 대해 20개의 샘플 저장이 완료되면 자동 종료한다.
+저장된 샘플은 show 명령을 통해 확인할 수 있다.
+
+long query detection 대상이 되는 command는 아래와 같다.
+```
+1. sop get
+2. lop insert
+3. lop delete
+4. lop get
+5. bop delete
+6. bop get
+7. bop count
+8. bop gbp
+```
+
+lqdetect command는 아래와 같다.
+```
+lqdetect [start [<detect_standard>] | stop | show | stats]\r\n
+```
+\<detect_standard\>는 long query로 분류하는 기준으로 해당 요청에서 접근하는 elements 수로 나타내며, 어떤 요청에서 detection 기준 이상으로 많은 elements를 접근하는 요청을 long query로 구분한다. 생략 시 default standard는 4000이다.
+
+start 명령으로 detection을 시작할 수 있다.
+
+stop 명령은 detection이 완료되기 전 중지하고 싶을 때 사용할 수 있다.
+
+show 명령은 저장된 명령어 샘플을 출력하고 그 결과는 아래와 같다.
+
+```
+-----------------------------------------------------------
+format : <time> <client_ip> <count> <command> <arguments>\n
+-----------------------------------------------------------
+
+sop get command entered count : 0
+
+lop insert command entered count : 0
+
+lop delete command entered count : 0
+
+lop get command entered count : 92
+17:56:33.276847 127.0.0.1 <46> lop get arcustest-Collection_List:YN8UCtNaoD4hHnMMwMJq1 0..44
+17:56:33.278116 127.0.0.1 <43> lop get arcustest-Collection_List:orjTteJo7F0bWdXDDGcP0 0..41
+17:56:33.279856 127.0.0.1 <48> lop get arcustest-Collection_List:r7ERYr3IdiD3RO8hLNvI3 0..46
+17:56:33.304063 127.0.0.1 <45> lop get arcustest-Collection_List:0OWKNF3Z17NaTSaDTZG61 0..43
+
+bop delete command entered count : 0
+
+bop get command entered count : 81
+17:56:33.142590 127.0.0.1 <47> bop get arcustest-Collection_Btree:0X6mqSiwBx6fEZVLuwKF0 0x626B65795F62797465417272793030..0x626B65795F6279746541727279303530 efilter 0 47
+17:56:33.142762 127.0.0.1 <49> bop get arcustest-Collection_Btree:PiX8strLCv7iWywd1ZuE0 0x626B65795F62797465417272793030..0x626B65795F6279746541727279303530 efilter 0 49
+17:56:33.143326 127.0.0.1 <46> bop get arcustest-Collection_Btree:PiX8strLCv7iWywd1ZuE1 0x626B65795F62797465417272793130..0x626B65795F6279746541727279313530 efilter 0 48
+
+bop count command entered count : 0
+
+bop gbp command entered count : 0
+```
+
+stats 명령은 가장 최근 수행된(수행 중인) long query detection의 상태를 조회하고 그 결과는 아래와 같다.
+```
+Long query detection stats
+The last running time : 20160126_175629 ~ 0_0     //bgndata_bgntime ~ enddate_endtime
+The number of total long query commands : 1152    //detected_commands 
+The detection standard : 43                       //standard
+How long query detection stopped : is running     //stop by explicit request
+                                                    stop by long query overflow
+                                                    is running
+```
+
+### Key dump 명령
+
+Arcus cache server의 key를 dump 한다.
+
+dump ascii command는 아래와 같다.
+```
+dump start key [<prefix>] filepath\r\n
+dump stop\r\n
+stats dump\r\n
+```
+dump start명령.
+- 첫번째 인자는 무조건 "key"이다.
+  - 현재는 일단 key string만을 dump한다.
+  - 향후에 key or item을 선택할 수 있게 하여, item인 경우 item 전체 내용을 dump할 수 있다.
+- 두번째 인자는 \<prefix\>는 cache key의 prefix를 의미하며, 생략 가능하다.
+  - 생략하면, 모든 key string을 dump한다.
+  - "null"을 주면, prefix가 없는 key string을 dump한다.
+  - 어떤 prefix를 주면, 그 prefix의 모든 key string을 dump한다.
+- 세번째 인자는 \<file path\>이다.
+  - 반드시 명시해야 한다.
+  - 절대 path로 줄 수도 있으며, 상대 path도 가능하다.
+  - 상대 path이면 memcached process가 구동된 위치에서의 상대 path이다.
+
+dump stop은 혹시나 dump 작업이 너무 오려 걸려
+중지하고 싶을 경우에 사용할 수 있다.
+
+stats dump는 현재 진행중인 dump 또는 가장 최근에 수행된 dump의 stats을 보여 준다.
+
+dump 파일은 무조건 하나의 file로 만들어 진다.
+file 내용의 format은 아래와 같다.
+
+```
+<type> <key_string> <exptime>\n
+...
+<type> <key_string> <exptime>\n
+DUMP SUMMARY: { prefix=<prefix>, count=<count>, total=<total> elapsed=<elapsed> }\n
+```
+
+위의 결과에서 각 의미는 아래와 같다.
+- key dump 결과 부분
+  - \<type\>은 item type으로 1 character로 표시한다.
+     - "K" : kv 
+     - "L" : list
+     - "S" : set
+     - "B" : b+tree
+  - \<key_string\>은 cache server에 저장되어 있는 key string 이다.
+  - \<exptime\>은 key의 exptime으로 아래 값들 중 하나이다.
+    -  0 (exptime = 0인 경우)
+    - -1 : sticky item (exptime = -1인 경우)
+    - timestamp (exptime > 0인 경우)으로
+      "time since the Epoch (00:00:00 UTC, January 1, 1970), measured in seconds" 이다.
+- DUMP SUMMARY 부분
+  - \<prefix\>는 prefix name이다.
+    - 모든 key dump이면, "\<all\>"이 명시된다.
+    - prefix 없는 key dump이면, "\<null\>"이 명시된다.
+    - 특정 prefix의 key dump이면, 그 prefix name이 명시된다.
+  - \<count\>는 dump한 key 개수이다.
+  - \<total\>은 cache에 있는 전체 key 개수이다.
+  - \<elapsed\>는 dump하는 데 소요된 시간(단위: 초) 이다.
 
 ### Help 명령
 

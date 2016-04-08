@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +27,13 @@
 #include "rfc1321/md5c.c"
 #undef  PROTOTYPES
 
-#define MAX_SERVER_ITEM_COUNT 100
+#define MAX_NODE_NAME_LENGTH 128
+
+#define NUM_OF_HASHES 40
+#define NUM_PER_HASH  4
+
+/* 40 hashes, 4 numbers per hash = 160 hash points per node */
+#define NUM_NODE_HASHES (NUM_OF_HASHES * NUM_PER_HASH)
 
 struct server_item {
     char *hostport;
@@ -40,18 +47,16 @@ struct continuum_item {
 struct cluster_config {
     uint32_t self_id;                    // server index for this memcached
     char     *self_hostport;             // host:port string for this memcached
+    struct continuum_item self_continuum[NUM_NODE_HASHES];
 
     int      num_servers;                // number of memcached servers in cluster
     int      num_continuum;              // number of continuum
-
     struct   server_item *servers;       // server list
     struct   continuum_item *continuum;  // continuum list
 
     pthread_mutex_t lock;                // cluster lock
-
     EXTENSION_LOGGER_DESCRIPTOR *logger; // memcached logger
     int      verbose;                    // log level
-
     bool     is_valid;                   // is this configuration valid?
 };
 
@@ -85,22 +90,16 @@ static int continuum_item_cmp(const void *t1, const void *t2)
     else                               return -1;
 }
 
-#define NUM_OF_HASHES 40
-#define NUM_PER_HASH  4
-
 static bool ketama_continuum_generate(struct cluster_config *config,
                                       const struct server_item *servers, size_t num_servers,
                                       struct continuum_item **continuum, size_t *continuum_len)
 {
-    char host[MAX_SERVER_ITEM_COUNT+10] = "";
-    int host_len;
+    char nodename[MAX_NODE_NAME_LENGTH] = "";
+    int  nodenlen;
     int pp, hh, ss, nn;
     unsigned char digest[16];
 
-    // 40 hashes, 4 numbers per hash = 160 points per server
-    int points_per_server = NUM_OF_HASHES * NUM_PER_HASH;
-
-    *continuum = calloc(points_per_server * num_servers, sizeof(struct continuum_item));
+    *continuum = calloc(NUM_NODE_HASHES * num_servers, sizeof(struct continuum_item));
     if (*continuum == NULL) {
         config->logger->log(EXTENSION_LOG_WARNING, NULL, "calloc failed: continuum\n");
         return false;
@@ -108,9 +107,8 @@ static bool ketama_continuum_generate(struct cluster_config *config,
 
     for (ss=0, pp=0; ss<num_servers; ss++) {
         for (hh=0; hh<NUM_OF_HASHES; hh++) {
-            host_len = snprintf(host, MAX_SERVER_ITEM_COUNT+10, "%s-%u",
-                                servers[ss].hostport, hh);
-            hash_md5(host, host_len, digest);
+            nodenlen = snprintf(nodename, MAX_NODE_NAME_LENGTH, "%s-%u", servers[ss].hostport, hh);
+            hash_md5(nodename, nodenlen, digest);
             for (nn=0; nn<NUM_PER_HASH; nn++, pp++) {
                 (*continuum)[pp].index = ss;
                 (*continuum)[pp].point = ((uint32_t) (digest[3 + nn * NUM_PER_HASH] & 0xFF) << 24)
@@ -123,7 +121,6 @@ static bool ketama_continuum_generate(struct cluster_config *config,
 
     qsort(*continuum, pp, sizeof(struct continuum_item), continuum_item_cmp);
     *continuum_len = pp;
-
     return true;
 }
 
@@ -156,12 +153,10 @@ static bool server_item_populate(struct cluster_config *config,
              tok;
              tok=strtok_r(NULL, "-", &buf)) {
             char *hostport = strdup(server_list[i]);
-
             if (hostport == NULL) {
                 config->logger->log(EXTENSION_LOG_WARNING, NULL, "invalid server token\n");
                 server_item_free(*servers, i);
-                free(*servers);
-                *servers = NULL;
+                free(*servers); *servers = NULL;
                 return false;
             }
 
@@ -175,151 +170,79 @@ static bool server_item_populate(struct cluster_config *config,
     return true;
 }
 
-struct cluster_config *cluster_config_init(EXTENSION_LOGGER_DESCRIPTOR *logger, int verbose)
+static void cluster_config_print_node_list(struct cluster_config *config)
 {
-    struct cluster_config *config;
-    int err;
+    assert(config->num_servers > 0 && config->servers != NULL);
 
-    config = calloc(1, sizeof(struct cluster_config));
-    if (config == NULL) {
-        logger->log(EXTENSION_LOG_WARNING, NULL, "calloc failed: cluster_config\n");
-        return NULL;
+    config->logger->log(EXTENSION_LOG_DEBUG, NULL,
+                        "cluster node list: count=%d\n", config->num_servers);
+    for (int i = 0; i < config->num_servers; i++) {
+        config->logger->log(EXTENSION_LOG_DEBUG, NULL, "node[%d]: %s\n",
+                            i, config->servers[i].hostport);
     }
-
-    err = pthread_mutex_init(&config->lock, NULL);
-    assert(err == 0);
-
-    config->logger = logger;
-    config->verbose = verbose;
-    config->is_valid = false;
-    return config;
 }
 
-void cluster_config_free(struct cluster_config *config)
+static void cluster_config_print_continuum(struct cluster_config *config)
 {
-    if (config == NULL) {
-        return;
+    assert(config->num_continuum > 0 && config->continuum!= NULL);
+
+    config->logger->log(EXTENSION_LOG_DEBUG, NULL,
+                        "cluster continuum: count=%d\n", config->num_continuum);
+    for (int i = 0; i < config->num_continuum; i++) {
+        config->logger->log(EXTENSION_LOG_DEBUG, NULL, "continuum[%d]: sidx=%d, hash=%x\n",
+                            i, config->continuum[i].index, config->continuum[i].point);
     }
-    if (config->continuum) {
-        free(config->continuum);
-        config->continuum = NULL;
+}
+
+static void build_self_continuum(struct continuum_item *continuum, const char *hostport)
+{
+    char nodename[MAX_NODE_NAME_LENGTH] = "";
+    int  nodenlen;
+    int  hh, nn, pp;
+    unsigned char digest[16];
+
+    /* build sorted hash map */
+    pp = 0;
+    for (hh=0; hh<NUM_OF_HASHES; hh++) {
+        nodenlen= snprintf(nodename, MAX_NODE_NAME_LENGTH, "%s-%u", hostport, hh);
+        hash_md5(nodename, nodenlen, digest);
+        for (nn=0; nn<NUM_PER_HASH; nn++, pp++) {
+            continuum[pp].index = 0;
+            continuum[pp].point = ((uint32_t) (digest[3 + nn * NUM_PER_HASH] & 0xFF) << 24)
+                                | ((uint32_t) (digest[2 + nn * NUM_PER_HASH] & 0xFF) << 16)
+                                | ((uint32_t) (digest[1 + nn * NUM_PER_HASH] & 0xFF) <<  8)
+                                | (           (digest[0 + nn * NUM_PER_HASH] & 0xFF)      );
+        }
     }
-    if (config->servers) {
-        server_item_free(config->servers, config->num_servers);
-        free(config->servers);
-        config->servers = NULL;
+    qsort(continuum, pp, sizeof(struct continuum_item), continuum_item_cmp);
+
+    /* build hash index */
+    for (pp=0; pp<NUM_NODE_HASHES; pp++) {
+        continuum[pp].index = (uint32_t)pp;
+        //fprintf(stderr, "continuum[%u] hash=%x\n", continuum[pp].index, continuum[pp].point);
     }
-    pthread_mutex_destroy(&config->lock);
-    free(config);
 }
 
-uint32_t cluster_config_self_id (struct cluster_config *config)
+static uint32_t find_continuum(struct continuum_item *continuum, size_t continuum_len,
+                               uint32_t hash_value)
 {
-    assert(config);
-    return config->self_id;
-}
-
-int cluster_config_num_servers(struct cluster_config *config)
-{
-    assert(config);
-    return config->num_servers;
-}
-
-int cluster_config_num_continuum(struct cluster_config *config)
-{
-    assert(config);
-    return config->num_continuum;
-}
-
-bool cluster_config_is_valid(struct cluster_config *config)
-{
-    assert(config);
-    return config->is_valid;
-}
-
-void cluster_config_set_hostport(struct cluster_config *config, const char *hostport, size_t hostport_len)
-{
-    assert(config);
-    assert(hostport);
-    assert(hostport_len > 0);
-    config->self_hostport = strndup(hostport, hostport_len);
-}
-
-bool cluster_config_reconfigure(struct cluster_config *config, char **server_list, size_t num_servers)
-{
-    assert(config);
-    assert(server_list);
-
-    uint32_t self_id = 0;
-    size_t num_continuum = 0;
-    struct server_item *servers = NULL;
-    struct continuum_item *continuum = NULL;
-
-    bool populated, generated;
-
-    populated = server_item_populate(config, server_list, num_servers, config->self_hostport,
-                                     &servers, &self_id);
-    if (!populated) {
-        config->logger->log(EXTENSION_LOG_WARNING, NULL, "reconfiguration failed: server_item_populate\n");
-        goto RECONFIG_FAILED;
-    }
-
-    generated = ketama_continuum_generate(config, servers, num_servers,
-                                          &continuum, &num_continuum);
-    if (!generated) {
-        config->logger->log(EXTENSION_LOG_WARNING, NULL, "reconfiguration failed: ketama_continuum_generate\n");
-        server_item_free(servers, num_servers);
-        free(servers);
-        servers = NULL;
-        goto RECONFIG_FAILED;
-    }
-
-    pthread_mutex_lock(&config->lock);
-
-    server_item_free(config->servers, config->num_servers);
-    free(config->servers);
-    free(config->continuum);
-
-    config->self_id = self_id;
-    config->num_servers = num_servers;
-    config->servers = servers;
-    config->continuum = continuum;
-    config->num_continuum = num_continuum;
-    config->is_valid = true;
-
-    pthread_mutex_unlock(&config->lock);
-    return true;
-
-RECONFIG_FAILED:
-    pthread_mutex_lock(&config->lock);
-    config->is_valid = false;
-    pthread_mutex_unlock(&config->lock);
-    return false;
-}
-
-bool cluster_config_key_is_mine(struct cluster_config *config, const char *key, size_t nkey,
-                                uint32_t *key_id, uint32_t *self_id)
-{
-    uint32_t server, self;
-    uint32_t digest, mid, prev;
     struct continuum_item *beginp, *endp, *midp, *highp, *lowp;
 
-    assert(config);
-    assert(config->continuum);
-
-    pthread_mutex_lock(&config->lock);
-
-    // this should not be happened
-    if (config->is_valid == false) {
-        pthread_mutex_unlock(&config->lock);
-        return true;
+    beginp = lowp = continuum;
+    endp = highp = continuum + continuum_len;
+    while (lowp < highp)
+    {
+        midp = lowp + (highp - lowp) / 2;
+        if (midp->point < hash_value)
+            lowp = midp + 1;
+        else
+            highp = midp;
     }
-
-    self = config->self_id;
-    digest = hash_ketama(key, nkey);
-    beginp = lowp = config->continuum;
-    endp = highp = config->continuum + config->num_continuum;
-
+    if (highp == endp)
+        highp = beginp;
+    return highp->index;
+#if 0 // OLD_CODE
+    uint32_t mid, prev;
     while (1) {
         // pick the middle point
         midp = lowp + (highp - lowp) / 2;
@@ -348,11 +271,180 @@ bool cluster_config_key_is_mine(struct cluster_config *config, const char *key, 
             break;
         }
     }
+    return server;
+#endif
+}
 
-    if ( key_id)  *key_id = server;
-    if (self_id) *self_id = self;
+struct cluster_config *cluster_config_init(const char *hostport, size_t hostport_len,
+                                           EXTENSION_LOGGER_DESCRIPTOR *logger, int verbose)
+{
+    assert(hostport);
+    assert(hostport_len > 0);
+    struct cluster_config *config;
+    int err;
 
+    config = calloc(1, sizeof(struct cluster_config));
+    if (config == NULL) {
+        logger->log(EXTENSION_LOG_WARNING, NULL, "calloc failed: cluster_config\n");
+        return NULL;
+    }
+
+    err = pthread_mutex_init(&config->lock, NULL);
+    assert(err == 0);
+
+    config->self_hostport = strndup(hostport, hostport_len);
+    build_self_continuum(config->self_continuum, config->self_hostport);
+
+    config->logger = logger;
+    config->verbose = verbose;
+    config->is_valid = false;
+    return config;
+}
+
+void cluster_config_free(struct cluster_config *config)
+{
+    if (config != NULL) {
+        if (config->continuum) {
+            free(config->continuum);
+            config->continuum = NULL;
+        }
+        if (config->servers) {
+            server_item_free(config->servers, config->num_servers);
+            free(config->servers);
+            config->servers = NULL;
+        }
+        free(config);
+    }
+}
+
+uint32_t cluster_config_self_id(struct cluster_config *config)
+{
+    assert(config);
+    return config->self_id;
+}
+
+int cluster_config_num_servers(struct cluster_config *config)
+{
+    assert(config);
+    return config->num_servers;
+}
+
+int cluster_config_num_continuum(struct cluster_config *config)
+{
+    assert(config);
+    return config->num_continuum;
+}
+
+int cluster_config_reconfigure(struct cluster_config *config,
+                               char **server_list, size_t num_servers)
+{
+    assert(config);
+    assert(server_list);
+
+    uint32_t self_id = 0;
+    size_t num_continuum = 0;
+    struct server_item *servers = NULL;
+    struct continuum_item *continuum = NULL;
+    bool populated, generated;
+    int ret = 0;
+
+    do {
+        populated = server_item_populate(config, server_list, num_servers,
+                                         config->self_hostport, &servers, &self_id);
+        if (!populated) {
+            config->logger->log(EXTENSION_LOG_WARNING, NULL,
+                                "reconfiguration failed: server_item_populate\n");
+            ret = -1; break;
+        }
+        generated = ketama_continuum_generate(config, servers, num_servers,
+                                              &continuum, &num_continuum);
+        if (!generated) {
+            config->logger->log(EXTENSION_LOG_WARNING, NULL,
+                                "reconfiguration failed: ketama_continuum_generate\n");
+            server_item_free(servers, num_servers);
+            free(servers); servers = NULL;
+            ret = -1; break;
+        }
+    } while(0);
+
+    pthread_mutex_lock(&config->lock);
+    if (ret == 0) {
+        server_item_free(config->servers, config->num_servers);
+        free(config->servers);
+        free(config->continuum);
+
+        config->self_id = self_id;
+        config->num_servers = num_servers;
+        config->servers = servers;
+        config->continuum = continuum;
+        config->num_continuum = num_continuum;
+        config->is_valid = true;
+    } else {
+        config->is_valid = false;
+    }
     pthread_mutex_unlock(&config->lock);
 
-    return server == self;
+    if (config->is_valid) {
+        if (config->verbose > 2) {
+            cluster_config_print_node_list(config);
+            cluster_config_print_continuum(config);
+        }
+    }
+    return ret;
 }
+
+int cluster_config_key_is_mine(struct cluster_config *config,
+                               const char *key, size_t nkey, bool *mine,
+                               uint32_t *key_id, uint32_t *self_id)
+{
+    uint32_t server, self;
+    uint32_t digest;
+    int ret = 0;
+
+    assert(config);
+    assert(config->continuum);
+
+    pthread_mutex_lock(&config->lock);
+    if (config->is_valid) {
+        /* cluster is valid */
+        self = config->self_id;
+        digest = hash_ketama(key, nkey);
+        server = find_continuum(config->continuum, config->num_continuum, digest);
+        *mine = (server == self ? true : false);
+        if ( key_id)  *key_id = server;
+        if (self_id) *self_id = self;
+    } else {
+        /* this case should not be happened. */
+        ret = -1; /* unknown cluster */
+    }
+    pthread_mutex_unlock(&config->lock);
+
+    return ret;
+}
+
+uint32_t cluster_config_ketama_hash(struct cluster_config *config,
+                                    const char *key, size_t nkey)
+{
+    assert(config);
+    return hash_ketama(key, nkey);
+}
+
+uint32_t cluster_config_hslice_index(struct cluster_config *config, uint32_t hvalue)
+{
+    assert(config);
+    return find_continuum(config->self_continuum, NUM_NODE_HASHES, hvalue);
+}
+
+/**** OLD CODE ****
+uint32_t cluster_config_ketama_hash(struct cluster_config *config,
+                                    const char *key, size_t nkey, int *hashidx)
+{
+    assert(config);
+    uint32_t digest = hash_ketama(key, nkey);
+    if (hashidx) {
+        *hashidx = (int)find_continuum(config->self_continuum, NUM_NODE_HASHES, digest);
+        assert(*hashidx >= 0 && *hashidx < NUM_NODE_HASHES);
+    }
+    return digest;
+}
+*******************/

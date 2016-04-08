@@ -2,6 +2,7 @@
 /*
  * arcus-memcached - Arcus memory cache server
  * Copyright 2010-2014 NAVER Corp.
+ * Copyright 2015 JaM2in Co., Ltd.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -860,10 +861,20 @@ extern "C"
             protocol_binary_response_header header;
             struct {
                 uint32_t elem_count; /* found element count */
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+                uint32_t miss_count; /* missed key count */
+                uint32_t trim_count; /* trimmed key count */
+                uint32_t dummy;
+#else
                 uint32_t kmis_count; /* missed key count */
+#endif
             } body;
         } message;
+#ifdef JHPARK_NEW_SMGET_INTERFACE
+        uint8_t bytes[sizeof(protocol_binary_response_header) + 16];
+#else
         uint8_t bytes[sizeof(protocol_binary_response_header) + 8];
+#endif
     } protocol_binary_response_bop_smget;
 #endif
 
