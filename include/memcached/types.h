@@ -31,6 +31,7 @@ struct iovec {
 #include <sys/uio.h>
 #endif
 
+#define ENABLE_ASCII_SASL
 #define MAP_COLLECTION_SUPPORT
 #define SUPPORT_BOP_MGET
 #define SUPPORT_BOP_SMGET
@@ -84,6 +85,16 @@ extern "C" {
         ENGINE_PREFIX_ENOENT = 0x52, /**< Attribute not found */
         ENGINE_FAILED      = 0xff  /**< Generic failue. */
     } ENGINE_ERROR_CODE;
+
+#ifdef ENABLE_ASCII_SASL
+    /**
+     * Core etc operations.
+     */
+    typedef enum {
+        OPERATION_SASL_AUTH = 1,
+        OPERATION_SASL_STEP
+    } CORE_ETC_OPERATION;
+#endif
 
     /**
      * Engine storage operations.

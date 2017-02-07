@@ -207,6 +207,17 @@ static int try_read_command(conn *c);
 static inline struct independent_stats *get_independent_stats(conn *c);
 static inline struct thread_stats *get_thread_stats(conn *c);
 
+#ifdef ENABLE_ASCII_SASL
+static void init_sasl_conn(conn *c);
+static void get_auth_data(const void *cookie, auth_data_t *data);
+
+struct sasl_tmp {
+    int ksize;
+    int vsize;
+    char data[]; /* data + ksize == value */
+};
+#endif
+
 enum try_read_result {
     READ_DATA_RECEIVED,
     READ_NO_DATA_RECEIVED,
@@ -2649,9 +2660,103 @@ static void process_bop_smget_complete(conn *c) {
 }
 #endif
 
+#ifdef ENABLE_ASCII_SASL
+static void process_sasl_complete(conn *c) {
+    assert(c->etc_op == OPERATION_SASL_AUTH ||
+           c->etc_op == OPERATION_SASL_STEP);
+    assert(c->item);
+
+    const char *out = NULL;
+    unsigned int outlen = 0;
+
+    init_sasl_conn(c);
+
+    struct sasl_tmp *stmp = c->item;
+    uint32_t nkey = stmp->ksize;
+    uint32_t vlen = stmp->vsize;
+
+    char mech[nkey+1];
+    memcpy(mech, stmp->data, nkey);
+    mech[nkey] = 0x00;
+
+    if (settings.verbose) {
+        mc_logger->log(EXTENSION_LOG_DEBUG, c,
+                "%d: mech : ``%s'' with %d bytes of data\n", c->sfd, mech, vlen);
+    }
+
+    const char *challenge = vlen == 0 ? NULL : (stmp->data + nkey);
+
+    int result=-1;
+
+    switch (c->etc_op) {
+    case OPERATION_SASL_AUTH:
+        result = sasl_server_start(c->sasl_conn, mech,
+                                   challenge, vlen,
+                                   &out, &outlen);
+        break;
+    case OPERATION_SASL_STEP:
+        result = sasl_server_step(c->sasl_conn,
+                                  challenge, vlen,
+                                  &out, &outlen);
+        break;
+    default:
+        assert(false); /* CMD should be one of the above */
+        /* This code is pretty much impossible, but makes the compiler
+           happier */
+        if (settings.verbose) {
+            mc_logger->log(EXTENSION_LOG_WARNING, c,
+                    "%d: Unhandled command %d with challenge %s\n",
+                    c->sfd, c->cmd, challenge);
+        }
+        break;
+    }
+
+    free(c->item);
+    c->item = NULL;
+    c->ritem = NULL;
+
+    if (settings.verbose) {
+        mc_logger->log(EXTENSION_LOG_INFO, c,
+                       "%d: sasl result code:  %d\n", c->sfd, result);
+    }
+
+    switch(result) {
+    case SASL_OK:
+        out_string(c, "Authenticated");
+        auth_data_t data;
+        get_auth_data(c, &data);
+        perform_callbacks(ON_AUTH, (const void*)&data, c);
+        STATS_NOKEY(c, auth_cmds);
+        break;
+    case SASL_CONTINUE:
+        add_iov(c, "CONTINUE", strlen("CONTINUE"));
+        if(outlen > 0) {
+            add_iov(c, out, outlen);
+        }
+        conn_set_state(c, conn_mwrite);
+        break;
+    default:
+        if (settings.verbose) {
+            mc_logger->log(EXTENSION_LOG_INFO, c,
+                           "%d: Unknown sasl response:  %d\n", c->sfd, result);
+        }
+        out_string(c, "ERROR");
+        STATS_NOKEY2(c, auth_cmds, auth_errors);
+    }
+}
+#endif
+
 static void complete_update_ascii(conn *c) {
     assert(c != NULL);
     assert(c->ewouldblock == false);
+
+#ifdef ENABLE_ASCII_SASL
+    if (c->etc_op == OPERATION_SASL_AUTH ||
+        c->etc_op == OPERATION_SASL_STEP) {
+        process_sasl_complete(c);
+        return;
+    }
+#endif
 
 #ifdef MAP_COLLECTION_SUPPORT
     if (c->coll_eitem != NULL || c->coll_strkeys != NULL) {
@@ -3740,11 +3845,13 @@ static void bin_list_sasl_mechs(conn *c) {
 }
 #endif
 
+#ifndef ENABLE_ASCII_SASL
 struct sasl_tmp {
     int ksize;
     int vsize;
     char data[]; /* data + ksize == value */
 };
+#endif
 
 static void process_bin_sasl_auth(conn *c) {
     assert(c->binary_header.request.extlen == 0);
@@ -3876,6 +3983,54 @@ static void process_bin_complete_sasl_auth(conn *c) {
     }
 }
 
+#ifdef ENABLE_ASCII_SASL
+static bool authenticated(conn *c, char *ascii_cmd) {
+   bool rv = false;
+
+   if (c->protocol == binary_prot) {
+        switch (c->cmd) {
+        case PROTOCOL_BINARY_CMD_SASL_LIST_MECHS: /* FALLTHROUGH */
+        case PROTOCOL_BINARY_CMD_SASL_AUTH:       /* FALLTHROUGH */
+        case PROTOCOL_BINARY_CMD_SASL_STEP:       /* FALLTHROUGH */
+        case PROTOCOL_BINARY_CMD_VERSION:         /* FALLTHROUGH */
+            rv = true;
+            break;
+        default:
+            if (c->sasl_conn) {
+                const void *uname = NULL;
+                sasl_getprop(c->sasl_conn, SASL_USERNAME, &uname);
+                rv = uname != NULL;
+            }
+        }
+
+        if (settings.verbose > 1) {
+            mc_logger->log(EXTENSION_LOG_DEBUG, c,
+                    "%d: authenticated() in cmd 0x%02x is %s\n",
+                    c->sfd, c->cmd, rv ? "true" : "false");
+        }
+    } else { /* ascii protocol */
+        if (strcmp(ascii_cmd, "sasl") == 0 ||
+            strcmp(ascii_cmd, "version") == 0 ||
+            strcmp(ascii_cmd, "quit") == 0) {
+            rv = true;
+        } else {
+            if (c->sasl_conn) {
+                const void *uname = NULL;
+                sasl_getprop(c->sasl_conn, SASL_USERNAME, &uname);
+                rv = uname != NULL;
+            }
+        }
+
+        if (settings.verbose > 1) {
+            mc_logger->log(EXTENSION_LOG_DEBUG, c,
+                    "%d: authenticated() in cmd %s is %s\n",
+                    c->sfd, ascii_cmd, rv ? "true" : "false");
+        }
+    }
+
+    return rv;
+}
+#else
 static bool authenticated(conn *c) {
     bool rv = false;
 
@@ -3902,6 +4057,7 @@ static bool authenticated(conn *c) {
 
     return rv;
 }
+#endif
 
 static void process_bin_lop_create(conn *c) {
     assert(c != NULL);
@@ -6421,11 +6577,19 @@ static void dispatch_bin_command(conn *c) {
     int keylen = c->binary_header.request.keylen;
     uint32_t bodylen = c->binary_header.request.bodylen;
 
+#ifdef ENABLE_ASCII_SASL
+    if (settings.require_sasl && !authenticated(c, NULL)) {
+        write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, 0);
+        c->write_and_go = conn_closing;
+        return;
+    }
+#else
     if (settings.require_sasl && !authenticated(c)) {
         write_bin_packet(c, PROTOCOL_BINARY_RESPONSE_AUTH_ERROR, 0);
         c->write_and_go = conn_closing;
         return;
     }
+#endif
 
     MEMCACHED_PROCESS_COMMAND_START(c->sfd, c->rcurr, c->rbytes);
     c->noreply = true;
@@ -8892,6 +9056,79 @@ static void process_config_command(conn *c, token_t *tokens, const size_t ntoken
         out_string(c, "CLIENT_ERROR bad command line format");
     }
 }
+
+#ifdef SASL_ENABLED
+#ifdef ENABLE_ASCII_SASL
+static void process_list_sasl_mechs(conn *c)
+{
+    init_sasl_conn(c);
+    const char *result_string = NULL;
+    unsigned int string_length = 0;
+    int result=sasl_listmech(c->sasl_conn, NULL,
+                             "",   /* What to prepend the string with */
+                             " ",  /* What to separate mechanisms with */
+                             "",   /* What to append to the string */
+                             &result_string, &string_length,
+                             NULL);
+    if (result != SASL_OK) {
+        /* Perhaps there's a better error for this... */
+        if (settings.verbose) {
+            mc_logger->log(EXTENSION_LOG_INFO, c,
+                     "%d: Failed to list SASL mechanisms.\n", c->sfd);
+        }
+        out_string(c, "SERVER_ERROR failed get a list of the supported SASL mechanisms");
+        return;
+    }
+    out_string(c, result_string);
+}
+
+static void process_sasl_command(conn *c, token_t *tokens, const size_t ntokens)
+{
+    if (strcmp(tokens[SUBCOMMAND_TOKEN].value, "listmechs") == 0)
+    {
+        process_list_sasl_mechs(c);
+    }
+    else if (strcmp(tokens[SUBCOMMAND_TOKEN].value, "auth") == 0 ||
+             strcmp(tokens[SUBCOMMAND_TOKEN].value, "step") == 0)
+    {
+        char *key = tokens[SUBCOMMAND_TOKEN+1].value;
+        size_t nkey = tokens[SUBCOMMAND_TOKEN+1].length;
+        uint32_t vlen = 0;
+
+        if(! safe_strtoul(tokens[SUBCOMMAND_TOKEN+2].value, &vlen)) {
+            out_string(c, "CLIENT_ERROR bad command line format");
+            return;
+        }
+
+        size_t buffer_size = sizeof(struct sasl_tmp) + nkey + vlen + 2;
+        struct sasl_tmp *data = calloc(sizeof(struct sasl_tmp) + buffer_size, 1);
+        if (!data) {
+            out_string(c, "SERVER_ERROR sasl data allocate failed");
+            c->write_and_go = conn_swallow;
+            return;
+        }
+
+        data->ksize = nkey;
+        data->vsize = vlen;
+        memcpy(data->data, key, nkey);
+
+        c->item = data;
+        c->ritem = data->data + nkey;
+        c->rlbytes = vlen;
+        if (strcmp(tokens[SUBCOMMAND_TOKEN].value, "auth") == 0) {
+            c->etc_op = OPERATION_SASL_AUTH;
+        } else { /* command is sasl step */
+            c->etc_op = OPERATION_SASL_STEP;
+        }
+        conn_set_state(c, conn_nread);
+    }
+    else
+    {
+        out_string(c, "CLIENT_ERROR bad command line format");
+    }
+}
+#endif
+#endif
 
 #ifdef JHPARK_KEY_DUMP
 static void process_dump_command(conn *c, token_t *tokens, const size_t ntokens)
@@ -12628,6 +12865,16 @@ static void process_command(conn *c, char *command, int cmdlen)
 
     ntokens = tokenize_command(command, cmdlen, tokens, MAX_TOKENS);
 
+#ifdef SASL_ENABLED
+#ifdef ENABLE_ASCII_SASL
+    if (settings.require_sasl && !authenticated(c, tokens[COMMAND_TOKEN].value)) {
+        out_string(c, "CLIENT_ERROR authentication is require");
+        c->write_and_go = conn_closing;
+        return;
+    }
+#endif
+#endif
+
     if ((ntokens >= 3) && ((strcmp(tokens[COMMAND_TOKEN].value, "get" ) == 0) ||
                            (strcmp(tokens[COMMAND_TOKEN].value, "bget") == 0)))
     {
@@ -12703,6 +12950,14 @@ static void process_command(conn *c, char *command, int cmdlen)
     {
         process_flush_command(c, tokens, ntokens, false);
     }
+#ifdef SASL_ENABLED
+#ifdef ENABLE_ASCII_SASL
+    else if ((ntokens >= 3 && ntokens <= 5) && (strcmp(tokens[COMMAND_TOKEN].value, "sasl") == 0))
+    {
+        process_sasl_command(c, tokens, ntokens);
+    }
+#endif
+#endif
     else if ((ntokens >  2) && (strcmp(tokens[COMMAND_TOKEN].value, "config") == 0))
     {
         process_config_command(c, tokens, ntokens);
@@ -14947,6 +15202,7 @@ int main (int argc, char **argv) {
         }
     }
 
+#ifndef ENABLE_ASCII_SASL
     if (settings.require_sasl) {
         if (!protocol_specified) {
             settings.binding_protocol = binary_prot;
@@ -14963,6 +15219,7 @@ int main (int argc, char **argv) {
             }
         }
     }
+#endif
 
     if (tcp_specified && !udp_specified) {
         settings.udpport = settings.port;

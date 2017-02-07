@@ -540,6 +540,9 @@ struct conn {
 
     void   *item;     /* for commands set/add/replace  */
     ENGINE_STORE_OPERATION    store_op; /* which one is it: set/add/replace */
+#ifdef ENABLE_ASCII_SASL
+    CORE_ETC_OPERATION   etc_op; /* which one auth/step */
+#endif
 
 
     /* data for the swallow state */
