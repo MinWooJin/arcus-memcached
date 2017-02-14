@@ -14910,6 +14910,10 @@ int main (int argc, char **argv) {
         case 'z': /* configure for Arcus zookeeper cluster */
                   /* host_list in the form of
                      -z 10.0.0.1:2181,10.0.0.2:2181,10.0.0.3:2181 */
+#ifdef ENABLE_ZK_ACL
+                  /* if use zookeeper ACLs, host_list with username:password
+                     -z 10.0.0.1:2181,10.0.0.2:2181^username:password */
+#endif
 
             arcus_zk_cfg = strdup(optarg);
             break;

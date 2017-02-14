@@ -138,6 +138,9 @@ volatile sig_atomic_t arcus_zk_shutdown=0;
 // placeholder for zookeeper and memcached settings
 typedef struct {
     char    *ensemble_list;     // ZK ensemble IP:port list
+#ifdef ENABLE_ZK_ACL
+    char    *zk_acl;            // ZK access control username:password
+#endif
     char    *svc;               // Service code name
     char    *mc_ipport;         // this memcached ip:port string
     char    *hostip;            // localhost server IP
@@ -165,6 +168,9 @@ typedef struct {
 
 arcus_zk_conf arcus_conf = {
     .ensemble_list  = NULL,
+#ifdef ENABLE_ZK_ACL
+    .zk_acl         = NULL,
+#endif
     .svc            = NULL,
     .mc_ipport      = NULL,
     .hostip         = NULL,
@@ -1135,6 +1141,18 @@ void arcus_zk_init(char *ensemble_list, int zk_to,
         arcus_exit(zh, EX_USAGE);
     }
 
+
+#ifdef ENABLE_ZK_ACL
+    /* parsing zk ACL username:password */
+    int   len = strlen(ensemble_list);
+    char *ptr = ensemble_list + len; /* '\0' */
+    while (ptr >= ensemble_list) {
+        if (*ptr == '^') break;
+        ptr--;
+    }
+    int acl_len = strlen(ptr);
+#endif
+
     // save these for later use (restart)
     if (!arcus_conf.init) {
         arcus_conf.port          = port;    // memcached listen port
@@ -1142,7 +1160,13 @@ void arcus_zk_init(char *ensemble_list, int zk_to,
         arcus_conf.engine.v1     = engine;
         arcus_conf.verbose       = verbose;
         arcus_conf.maxbytes      = maxbytes;
+#ifdef ENABLE_ZK_ACL
+        arcus_conf.ensemble_list = strndup(ensemble_list, len - acl_len);
+        if (acl_len != 0)
+            arcus_conf.zk_acl    = strndup(ptr+1, acl_len-1);
+#else
         arcus_conf.ensemble_list = strdup(ensemble_list);
+#endif
         // Use the user specified timeout only if it falls within
         // [MIN, MAX).  Otherwise, silently ignore it and use
         // the default value.
@@ -1209,6 +1233,17 @@ void arcus_zk_init(char *ensemble_list, int zk_to,
                 "cannot to be ZOO_CONNECTED_STATE\n");
         arcus_exit(zh, EX_PROTOCOL);
     }
+
+#ifdef ENABLE_ZK_ACL
+    if (arcus_conf.zk_acl != NULL) {
+        rc = zoo_add_auth(zh, "digest", arcus_conf.zk_acl, strlen(arcus_conf.zk_acl), 0, 0);
+        if (rc != ZOK) {
+            arcus_conf.logger->log(EXTENSION_LOG_WARNING, NULL,
+                    "zoo_add_auth_() failed (%d error)\n", rc);
+            arcus_exit(zh, EX_PROTOCOL);
+        }
+    }
+#endif
 
     /* check zk root directory and get the serice code */
     if (zk_root == NULL) {
