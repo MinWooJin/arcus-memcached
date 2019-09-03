@@ -109,6 +109,12 @@ static char *get_logtype_text(uint8_t type)
             return "BT_ELEM_INSERT";
         case LOG_BT_ELEM_DELETE:
             return "BT_ELEM_DELETE";
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        case LOG_OPERATION_BEGIN:
+            return "OPERATION_BEGIN";
+        case LOG_OPERATION_END:
+            return "OPERATION_END";
+#endif
         case LOG_SNAPSHOT_DONE:
             return "SNAPSHOT_DONE";
     }
@@ -933,6 +939,34 @@ static void lrec_bt_elem_delete_print(LogRec *logrec)
             log->body.keylen, (log->body.keylen <= 250 ? log->body.keylen : 250), keyptr, metastr);
 }
 
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+/* Operation Begin Log Record */
+static void lrec_operation_begin_write(LogRec *logrec, char *bufptr)
+{
+    OperationBeginLog *log = (OperationBeginLog*)logrec;
+    memcpy(bufptr, (void*)log, sizeof(LogHdr));
+}
+
+static void lrec_operation_begin_print(LogRec *logrec)
+{
+    LogHdr *hdr = &logrec->header;
+    lrec_header_print(hdr);
+}
+
+/* Operation End Log Record */
+static void lrec_operation_end_write(LogRec *logrec, char *bufptr)
+{
+    OperationEndLog *log = (OperationEndLog*)logrec;
+    memcpy(bufptr, (void*)log, sizeof(LogHdr));
+}
+
+static void lrec_operation_end_print(LogRec *logrec)
+{
+    LogHdr *hdr = &logrec->header;
+    lrec_header_print(hdr);
+}
+#endif
+
 /* Snapshot Element Log Record */
 static void lrec_snapshot_elem_link_write(LogRec *logrec, char *bufptr)
 {
@@ -1048,6 +1082,10 @@ LOGREC_FUNC logrec_func[] = {
     { lrec_map_elem_delete_write,    lrec_map_elem_delete_redo,    lrec_map_elem_delete_print },
     { lrec_bt_elem_insert_write,     lrec_bt_elem_insert_redo,     lrec_bt_elem_insert_print },
     { lrec_bt_elem_delete_write,     lrec_bt_elem_delete_redo,     lrec_bt_elem_delete_print },
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    { lrec_operation_begin_write,    NULL,                         lrec_operation_begin_print },
+    { lrec_operation_end_write,      NULL,                         lrec_operation_end_print },
+#endif
     { lrec_snapshot_elem_link_write, lrec_snapshot_elem_link_redo, lrec_snapshot_elem_link_print },
     { lrec_snapshot_done_write,      NULL,                         lrec_snapshot_done_print }
 };
@@ -1434,4 +1472,24 @@ int lrec_check_snapshot_done(SnapshotDoneLog *log)
     }
     return 0;
 }
+
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+int lrec_construct_operation_begin(LogRec *logrec)
+{
+    OperationBeginLog *log = (OperationBeginLog*)logrec;
+    log->header.logtype = LOG_OPERATION_BEGIN;
+    log->header.updtype = UPD_NONE;
+    log->header.body_length = 0;
+    return sizeof(OperationBeginLog);
+}
+
+int lrec_construct_operation_end(LogRec *logrec)
+{
+    OperationEndLog *log = (OperationEndLog*)logrec;
+    log->header.logtype = LOG_OPERATION_END;
+    log->header.updtype = UPD_NONE;
+    log->header.body_length = 0;
+    return sizeof(OperationEndLog);
+}
+#endif
 #endif

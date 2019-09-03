@@ -288,6 +288,38 @@ void CLOG_GE_ITEM_SETATTR(hash_item *it,
     }
 }
 
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+void CLOG_GE_OPERATION_BEGIN(void)
+{
+    if (1)
+    {
+#ifdef ENABLE_PERSISTENCE
+        if (config->use_persistence) {
+            OperationBeginLog log;
+            (void)lrec_construct_operation_begin((LogRec*)&log);
+            bool need_dual_write = (scanp != NULL ? true : false);
+            log_record_write((LogRec*)&log, cmdlog_get_cur_waiter(), need_dual_write);
+        }
+#endif
+    }
+}
+
+void CLOG_GE_OPERATION_END(void)
+{
+    if (1)
+    {
+#ifdef ENABLE_PERSISTENCE
+        if (config->use_persistence) {
+            OperationEndLog log;
+            (void)lrec_construct_operation_end((LogRec*)&log);
+            bool need_dual_write = (scanp != NULL ? true : false);
+            log_record_write((LogRec*)&log, cmdlog_get_cur_waiter(), need_dual_write);
+        }
+#endif
+    }
+}
+#endif
+
 /*
  * Initialize change log module
  */

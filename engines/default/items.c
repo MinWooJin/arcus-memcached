@@ -6615,6 +6615,9 @@ ENGINE_ERROR_CODE list_elem_insert(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -6634,6 +6637,12 @@ ENGINE_ERROR_CODE list_elem_insert(const char *key, const uint32_t nkey,
         if (it == NULL) {
             ret = ENGINE_ENOMEM;
         } else {
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            CLOG_OPERATION_BEGIN();
+            created_multi_lrec = true;
+#endif
+#endif
             ret = do_item_link(it);
             if (ret == ENGINE_SUCCESS) {
                 *created = true;
@@ -6649,6 +6658,11 @@ ENGINE_ERROR_CODE list_elem_insert(const char *key, const uint32_t nkey,
         }
     }
     if (it != NULL) do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     UNLOCK_CACHE();
 
 #ifdef ENABLE_PERSISTENCE
@@ -6695,6 +6709,9 @@ ENGINE_ERROR_CODE list_elem_delete(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -6722,7 +6739,14 @@ ENGINE_ERROR_CODE list_elem_delete(const char *key, const uint32_t nkey,
                 index = to_index;
                 count = from_index - to_index + 1;
             }
-
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            if (drop_if_empty) {
+                CLOG_OPERATION_BEGIN();
+                created_multi_lrec = true;
+            }
+#endif
+#endif
             *del_count = do_list_elem_delete(info, index, count, ELEM_DELETE_NORMAL);
             if (*del_count > 0) {
                 if (info->ccnt == 0 && drop_if_empty) {
@@ -6736,6 +6760,11 @@ ENGINE_ERROR_CODE list_elem_delete(const char *key, const uint32_t nkey,
             }
         } while(0);
         do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     }
     UNLOCK_CACHE();
 
@@ -6757,6 +6786,9 @@ ENGINE_ERROR_CODE list_elem_get(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence && delete) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -6795,7 +6827,14 @@ ENGINE_ERROR_CODE list_elem_get(const char *key, const uint32_t nkey,
             if ((eresult->elem_array = (eitem **)malloc(count * sizeof(eitem*))) == NULL) {
                 ret = ENGINE_ENOMEM; break;
             }
-
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            if (delete && drop_if_empty) {
+                CLOG_OPERATION_BEGIN();
+                created_multi_lrec = true;
+            }
+#endif
+#endif
             ret = do_list_elem_get(info, index, count, forward, delete,
                                   (list_elem_item**)(eresult->elem_array), &(eresult->elem_count));
             if (ret == ENGINE_SUCCESS) {
@@ -6814,6 +6853,11 @@ ENGINE_ERROR_CODE list_elem_get(const char *key, const uint32_t nkey,
             }
         } while(0);
         do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     }
     UNLOCK_CACHE();
 
@@ -6908,6 +6952,9 @@ ENGINE_ERROR_CODE set_elem_insert(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -6927,6 +6974,12 @@ ENGINE_ERROR_CODE set_elem_insert(const char *key, const uint32_t nkey,
         if (it == NULL) {
             ret = ENGINE_ENOMEM;
         } else {
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            CLOG_OPERATION_BEGIN();
+            created_multi_lrec = true;
+#endif
+#endif
             ret = do_item_link(it);
             if (ret == ENGINE_SUCCESS) {
                 *created = true;
@@ -6942,6 +6995,11 @@ ENGINE_ERROR_CODE set_elem_insert(const char *key, const uint32_t nkey,
         }
     }
     if (it != NULL) do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     UNLOCK_CACHE();
 
 #ifdef ENABLE_PERSISTENCE
@@ -6961,6 +7019,9 @@ ENGINE_ERROR_CODE set_elem_delete(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -6976,6 +7037,14 @@ ENGINE_ERROR_CODE set_elem_delete(const char *key, const uint32_t nkey,
     LOCK_CACHE();
     ret = do_set_item_find(key, nkey, DONT_UPDATE, &it);
     if (ret == ENGINE_SUCCESS) { /* it != NULL */
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (drop_if_empty) {
+            CLOG_OPERATION_BEGIN();
+            created_multi_lrec = true;
+        }
+#endif
+#endif
         set_meta_info *info = (set_meta_info *)item_get_meta(it);
         ret = do_set_elem_delete_with_value(info, value, nbytes, ELEM_DELETE_NORMAL);
         if (ret == ENGINE_SUCCESS) {
@@ -6985,6 +7054,11 @@ ENGINE_ERROR_CODE set_elem_delete(const char *key, const uint32_t nkey,
             }
         }
         do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     }
     UNLOCK_CACHE();
 
@@ -7032,6 +7106,9 @@ ENGINE_ERROR_CODE set_elem_get(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence && delete) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -7061,6 +7138,14 @@ ENGINE_ERROR_CODE set_elem_get(const char *key, const uint32_t nkey,
             if (eresult->elem_array == NULL) {
                 ret = ENGINE_ENOMEM; break;
             }
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            if (delete && (drop_if_empty || count != 1)) {
+                CLOG_OPERATION_BEGIN();
+                created_multi_lrec = true;
+            }
+#endif
+#endif
             ret = do_set_elem_get(info, count, delete,
                                   (set_elem_item**)(eresult->elem_array), &(eresult->elem_count));
             if (ret == ENGINE_SUCCESS) {
@@ -7079,6 +7164,11 @@ ENGINE_ERROR_CODE set_elem_get(const char *key, const uint32_t nkey,
             }
         } while (0);
         do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     }
     UNLOCK_CACHE();
 
@@ -7182,6 +7272,9 @@ ENGINE_ERROR_CODE btree_elem_insert(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -7206,6 +7299,12 @@ ENGINE_ERROR_CODE btree_elem_insert(const char *key, const uint32_t nkey,
         if (it == NULL) {
             ret = ENGINE_ENOMEM;
         } else {
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            CLOG_OPERATION_BEGIN();
+            created_multi_lrec = true;
+#endif
+#endif
             ret = do_item_link(it);
             if (ret == ENGINE_SUCCESS) {
                 *created = true;
@@ -7225,6 +7324,11 @@ ENGINE_ERROR_CODE btree_elem_insert(const char *key, const uint32_t nkey,
         }
     }
     if (it != NULL) do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     UNLOCK_CACHE();
 
 #ifdef ENABLE_PERSISTENCE
@@ -7292,6 +7396,9 @@ ENGINE_ERROR_CODE btree_elem_delete(const char *key, const uint32_t nkey,
     int bkrtype = do_btree_bkey_range_type(bkrange);
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -7314,6 +7421,14 @@ ENGINE_ERROR_CODE btree_elem_delete(const char *key, const uint32_t nkey,
                 (info->bktype == BKEY_TYPE_BINARY && bkrange->from_nbkey == 0)) {
                 ret = ENGINE_EBADBKEY; break;
             }
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            if (drop_if_empty || (bkrange->to_nbkey != BKEY_NULL && req_count != 1)) {
+                CLOG_OPERATION_BEGIN();
+                created_multi_lrec = true;
+            }
+#endif
+#endif
             *del_count = do_btree_elem_delete(info, bkrtype, bkrange, efilter, req_count,
                                               access_count, ELEM_DELETE_NORMAL);
             if (*del_count > 0) {
@@ -7329,6 +7444,11 @@ ENGINE_ERROR_CODE btree_elem_delete(const char *key, const uint32_t nkey,
             }
         } while(0);
         do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     }
     UNLOCK_CACHE();
 
@@ -7418,6 +7538,9 @@ ENGINE_ERROR_CODE btree_elem_get(const char *key, const uint32_t nkey,
     bool potentialbkeytrim;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence && delete) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -7454,6 +7577,14 @@ ENGINE_ERROR_CODE btree_elem_get(const char *key, const uint32_t nkey,
             if (eresult->elem_array == NULL) {
                 ret = ENGINE_ENOMEM; break;
             }
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            if (delete && (drop_if_empty || (bkrange->to_nbkey != BKEY_NULL && req_count != 1))) {
+                CLOG_OPERATION_BEGIN();
+                created_multi_lrec = true;
+            }
+#endif
+#endif
             ret = do_btree_elem_get(info, bkrtype, bkrange, efilter,
                                     offset, req_count, delete, (btree_elem_item **)(eresult->elem_array),
                                     &(eresult->elem_count), &(eresult->access_count), &potentialbkeytrim);
@@ -7479,6 +7610,11 @@ ENGINE_ERROR_CODE btree_elem_get(const char *key, const uint32_t nkey,
             }
         } while (0);
         do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     }
     UNLOCK_CACHE();
 
@@ -9965,6 +10101,9 @@ ENGINE_ERROR_CODE map_elem_insert(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -9984,6 +10123,12 @@ ENGINE_ERROR_CODE map_elem_insert(const char *key, const uint32_t nkey,
         if (it == NULL) {
             ret = ENGINE_ENOMEM;
         } else {
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            CLOG_OPERATION_BEGIN();
+            created_multi_lrec = true;
+#endif
+#endif
             ret = do_item_link(it);
             if (ret == ENGINE_SUCCESS) {
                 *created = true;
@@ -9999,6 +10144,11 @@ ENGINE_ERROR_CODE map_elem_insert(const char *key, const uint32_t nkey,
         }
     }
     if (it != NULL) do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     UNLOCK_CACHE();
 
 #ifdef ENABLE_PERSISTENCE
@@ -10054,6 +10204,9 @@ ENGINE_ERROR_CODE map_elem_delete(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -10069,6 +10222,14 @@ ENGINE_ERROR_CODE map_elem_delete(const char *key, const uint32_t nkey,
     LOCK_CACHE();
     ret = do_map_item_find(key, nkey, DONT_UPDATE, &it);
     if (ret == ENGINE_SUCCESS) { /* it != NULL */
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (drop_if_empty || numfields != 1) {
+            CLOG_OPERATION_BEGIN();
+            created_multi_lrec = true;
+        }
+#endif
+#endif
         map_meta_info *info = (map_meta_info *)item_get_meta(it);
         *del_count = do_map_elem_delete_with_field(info, numfields, flist, ELEM_DELETE_NORMAL);
         if (*del_count > 0) {
@@ -10081,6 +10242,11 @@ ENGINE_ERROR_CODE map_elem_delete(const char *key, const uint32_t nkey,
             ret = ENGINE_ELEM_ENOENT;
         }
         do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     }
     UNLOCK_CACHE();
 
@@ -10102,6 +10268,9 @@ ENGINE_ERROR_CODE map_elem_get(const char *key, const uint32_t nkey,
     ENGINE_ERROR_CODE ret;
 #ifdef ENABLE_PERSISTENCE
     log_waiter_t *waiter = NULL;
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+    bool created_multi_lrec = false;
+#endif
     if (config->use_persistence && delete) {
         waiter = cmdlog_waiter_alloc(cookie);
         if (waiter == NULL) {
@@ -10131,6 +10300,14 @@ ENGINE_ERROR_CODE map_elem_get(const char *key, const uint32_t nkey,
             if (eresult->elem_array == NULL) {
                 ret = ENGINE_ENOMEM; break;
             }
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+            if (delete && (drop_if_empty || numfields != 1)) {
+                CLOG_OPERATION_BEGIN();
+                created_multi_lrec = true;
+            }
+#endif
+#endif
             ret = do_map_elem_get(info, numfields, flist, delete,
                                   (map_elem_item **)eresult->elem_array, &(eresult->elem_count));
             if (ret == ENGINE_SUCCESS) {
@@ -10149,6 +10326,11 @@ ENGINE_ERROR_CODE map_elem_get(const char *key, const uint32_t nkey,
             }
         } while (0);
         do_item_release(it);
+#ifdef ENABLE_PERSISTENCE
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+        if (created_multi_lrec) CLOG_OPERATION_END();
+#endif
+#endif
     }
     UNLOCK_CACHE();
 

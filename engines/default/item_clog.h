@@ -49,6 +49,10 @@ void CLOG_GE_BTREE_ELEM_DELETE(btree_meta_info *info,
                                enum elem_delete_cause cause);
 void CLOG_GE_ITEM_SETATTR(hash_item *it,
                           ENGINE_ITEM_ATTR *attr_ids, uint32_t attr_cnt);
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+void CLOG_GE_OPERATION_BEGIN(void);
+void CLOG_GE_OPERATION_END(void);
+#endif
 
 /* macros for CLOG function substitution. */
 #define CLOG_ITEM_LINK(a) \
@@ -103,6 +107,16 @@ void CLOG_GE_ITEM_SETATTR(hash_item *it,
     if (item_clog_enabled) { \
         CLOG_GE_ITEM_SETATTR(a,b,c); \
     }
+#ifdef ENABLE_PERSISTENCE_05_ADD_END
+#define CLOG_OPERATION_BEGIN() \
+    if (item_clog_enabled) { \
+        CLOG_GE_OPERATION_BEGIN(); \
+    }
+#define CLOG_OPERATION_END() \
+    if (item_clog_enabled) { \
+        CLOG_GE_OPERATION_END(); \
+    }
+#endif
 
 /* functions for initialize change log module */
 void item_clog_init(struct default_engine *engine);
