@@ -26,12 +26,24 @@
 #include "checkpoint.h"
 #include "item_clog.h"
 
+#ifdef ENABLE_PERSISTENCE_03_ENHAN_FQUEUE
+#define WAITER_ALLOC_SIZE 4096
+#endif
+
 typedef struct _wait_entry_info {
+#ifdef ENABLE_PERSISTENCE_03_ENHAN_FQUEUE
+    int32_t           free_list;
+    int32_t           used_head;
+    int32_t           used_tail;
+    int32_t           cur_waiters;
+    int32_t           max_waiters;
+#else
     int16_t           free_list;
     int16_t           used_head;
     int16_t           used_tail;
     uint16_t          cur_waiters;
     uint16_t          max_waiters;
+#endif
 } log_wait_entry_info;
 
 /* commandlog global structure */
@@ -62,6 +74,34 @@ static ENGINE_ERROR_CODE cmdlog_mgr_recovery()
     return ENGINE_SUCCESS;
 }
 
+#ifdef ENABLE_PERSISTENCE_03_ENHAN_FQUEUE
+/*
+ * Static Functions
+ */
+static void grow_wait_entry_table(void)
+{
+    int i;
+    log_wait_entry_info *info = &logmgr_gl.wait_entry_info;
+    int32_t cur_waiters = info->max_waiters;
+    int32_t new_waiters = info->max_waiters + WAITER_ALLOC_SIZE;
+
+    log_waiter_t *new_entry_table = realloc(logmgr_gl.wait_entry_table, new_waiters * sizeof(log_waiter_t));
+    if (new_entry_table == NULL) {
+        return;
+    }
+    logmgr_gl.wait_entry_table = new_entry_table;
+    info->max_waiters = new_waiters;
+
+    for (i = cur_waiters; i < info->max_waiters; i++) {
+        logmgr_gl.wait_entry_table[i].curr_eid = i;
+        if (i < (info->max_waiters-1)) logmgr_gl.wait_entry_table[i].next_eid = i+1;
+        else                           logmgr_gl.wait_entry_table[i].next_eid = -1;
+        LOGSN_SET_NULL(&logmgr_gl.wait_entry_table[i].lsn);
+    }
+    info->free_list = cur_waiters;
+}
+#endif
+
 /*
  * External Functions
  */
@@ -69,6 +109,11 @@ log_waiter_t *cmdlog_waiter_alloc(void)
 {
     log_waiter_t *waiter = NULL;
     log_wait_entry_info *info = &logmgr_gl.wait_entry_info;
+#ifdef ENABLE_PERSISTENCE_03_ENHAN_FQUEUE
+    if (info->free_list == -1) {
+        grow_wait_entry_table();
+    }
+#endif
     if (info->free_list != -1) {
         waiter = &logmgr_gl.wait_entry_table[info->free_list];
         info->free_list = waiter->next_eid;
@@ -117,7 +162,11 @@ ENGINE_ERROR_CODE cmdlog_waiter_init(struct default_engine *engine)
 
     log_wait_entry_info *info = &logmgr_gl.wait_entry_info;
     info->cur_waiters = 0;
+#ifdef ENABLE_PERSISTENCE_03_ENHAN_FQUEUE
+    info->max_waiters = WAITER_ALLOC_SIZE;
+#else
     info->max_waiters = 4096; /* FIXME: recomputation max logmgr and change configurable */
+#endif
 
     logmgr_gl.wait_entry_table = (log_waiter_t *)malloc(info->max_waiters * sizeof(log_waiter_t));
     if (logmgr_gl.wait_entry_table == NULL) {
@@ -127,7 +176,7 @@ ENGINE_ERROR_CODE cmdlog_waiter_init(struct default_engine *engine)
     for (i = 0; i < info->max_waiters; i++) {
         logmgr_gl.wait_entry_table[i].curr_eid = i;
         if (i < (info->max_waiters-1)) logmgr_gl.wait_entry_table[i].next_eid = i+1;
-        else                          logmgr_gl.wait_entry_table[i].next_eid = -1;
+        else                           logmgr_gl.wait_entry_table[i].next_eid = -1;
         LOGSN_SET_NULL(&logmgr_gl.wait_entry_table[i].lsn);
     }
     info->free_list = 0; /* the first entry */
