@@ -180,10 +180,13 @@ ENGINE_ERROR_CODE cmdlog_mgr_init(struct default_engine* engine)
     /* set enable change log */
     (void)item_clog_set_enable(true);
 
+#ifdef DIRECT_WRITE
+#else
     ret = cmdlog_buf_flush_thread_start();
     if (ret != ENGINE_SUCCESS) {
         return ret;
     }
+#endif
     ret = chkpt_thread_start();
     if (ret != ENGINE_SUCCESS) {
         return ret;

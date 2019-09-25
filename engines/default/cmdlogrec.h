@@ -335,6 +335,10 @@ int lrec_construct_btree_elem_delete(LogRec *logrec, hash_item *it, btree_elem_i
 
 /* Function to write the given log record to log buffer */
 void lrec_write_to_buffer(LogRec *logrec, char *bufptr);
+#ifdef DIRECT_WRITE
+/* Function to write the given log record to log file */
+void lrec_write_to_file(LogRec *logrec, int logsize, bool dual_write, int fd);
+#endif
 /* Function to redo from the given log record. */
 ENGINE_ERROR_CODE lrec_redo_from_record(LogRec *logrec);
 

@@ -223,6 +223,50 @@ static void lrec_it_link_write(LogRec *logrec, char *bufptr)
     memcpy(bufptr + offset, log->keyptr, cm->keylen + cm->vallen);
 }
 
+#ifdef DIRECT_WRITE
+static void lrec_it_link_file_write(LogRec *logrec, int logsize, bool dual_write, int fd)
+{
+    ITLinkLog  *log = (ITLinkLog*)logrec;
+    ITLinkData *body = &log->body;
+    struct lrec_item_common *cm = (struct lrec_item_common*)&body->cm;
+    int offset = sizeof(LogHdr) + offsetof(ITLinkData, data);
+    struct iovec iov[3];
+    int iov_index = 0;
+
+#if 1 // FIXME: need handling
+    assert(fd != -1);
+    assert(dual_write == false);
+#endif
+
+    iov[iov_index].iov_base = (void*)logrec;
+    iov[iov_index].iov_len  = offset;
+    iov_index++;
+
+    if (cm->ittype == ITEM_TYPE_BTREE) {
+        struct lrec_coll_meta *meta = (struct lrec_coll_meta*)&body->ptr.meta;
+        if (meta->maxbkrlen != BKEY_NULL) {
+            /* maxbkeyrange value copy */
+            iov[iov_index].iov_base = log->maxbkrptr;
+            iov[iov_index].iov_len  = BTREE_REAL_NBKEY(meta->maxbkrlen);
+            iov_index++;
+        }
+    }
+
+    /* key value copy */
+    iov[iov_index].iov_base = log->keyptr;
+    iov[iov_index].iov_len  = cm->keylen + cm->vallen;
+    iov_index++;
+
+#if 1 // FIXME: need total length & -1 return check
+    ssize_t nr = writev(fd, iov, iov_index);
+    if (nr == -1) {
+       /* temp code */
+       nr = 0;
+    }
+#endif
+}
+#endif
+
 static ENGINE_ERROR_CODE lrec_it_link_redo(LogRec *logrec)
 {
     ENGINE_ERROR_CODE ret = ENGINE_FAILED;
@@ -943,10 +987,31 @@ static void lrec_snapshot_done_print(LogRec *logrec)
 /* Log Record Function */
 typedef struct _logrec_func {
     void (*write)(LogRec *logrec, char *bufptr);
+#ifdef DIRECT_WRITE
+    void (*file_write)(LogRec *logrec, int logsize, bool dual_write, int fd);
+#endif
     ENGINE_ERROR_CODE (*redo)(LogRec *logrec);
     void (*print)(LogRec *logrec);
 } LOGREC_FUNC;
 
+#ifdef DIRECT_WRITE
+LOGREC_FUNC logrec_func[] = {
+    { lrec_it_link_write,            lrec_it_link_file_write,      lrec_it_link_redo,            lrec_it_link_print },
+    { lrec_it_unlink_write,          NULL,                         lrec_it_unlink_redo,          lrec_it_unlink_print },
+    { lrec_it_setattr_write,         NULL,                         lrec_it_setattr_redo,         lrec_it_setattr_print },
+    { lrec_it_flush_write,           NULL,                         lrec_it_flush_redo,           lrec_it_flush_print },
+    { lrec_list_elem_insert_write,   NULL,                         lrec_list_elem_insert_redo,   lrec_list_elem_insert_print },
+    { lrec_list_elem_delete_write,   NULL,                         lrec_list_elem_delete_redo,   lrec_list_elem_delete_print },
+    { lrec_set_elem_insert_write,    NULL,                         lrec_set_elem_insert_redo,    lrec_set_elem_insert_print },
+    { lrec_set_elem_delete_write,    NULL,                         lrec_set_elem_delete_redo,    lrec_set_elem_delete_print },
+    { lrec_map_elem_insert_write,    NULL,                         lrec_map_elem_insert_redo,    lrec_map_elem_insert_print },
+    { lrec_map_elem_delete_write,    NULL,                         lrec_map_elem_delete_redo,    lrec_map_elem_delete_print },
+    { lrec_bt_elem_insert_write,     NULL,                         lrec_bt_elem_insert_redo,     lrec_bt_elem_insert_print },
+    { lrec_bt_elem_delete_write,     NULL,                         lrec_bt_elem_delete_redo,     lrec_bt_elem_delete_print },
+    { lrec_snapshot_elem_link_write, NULL,                         lrec_snapshot_elem_link_redo, lrec_snapshot_elem_link_print },
+    { lrec_snapshot_done_write,      NULL,                         NULL,                         lrec_snapshot_done_print }
+};
+#else
 LOGREC_FUNC logrec_func[] = {
     { lrec_it_link_write,            lrec_it_link_redo,            lrec_it_link_print },
     { lrec_it_unlink_write,          lrec_it_unlink_redo,          lrec_it_unlink_print },
@@ -963,6 +1028,7 @@ LOGREC_FUNC logrec_func[] = {
     { lrec_snapshot_elem_link_write, lrec_snapshot_elem_link_redo, lrec_snapshot_elem_link_print },
     { lrec_snapshot_done_write,      NULL,                         lrec_snapshot_done_print }
 };
+#endif
 
 /* external function */
 
@@ -979,6 +1045,16 @@ void lrec_write_to_buffer(LogRec *logrec, char *bufptr)
     logrec_func[logrec->header.logtype].print(logrec);
 #endif
 }
+
+#ifdef DIRECT_WRITE
+void lrec_write_to_file(LogRec *logrec, int logsize, bool dual_write, int fd)
+{
+    logrec_func[logrec->header.logtype].file_write(logrec, logsize, dual_write, fd);
+#ifdef DEBUG_PERSISTENCE_DISK_FORMAT_PRINT
+    logrec_func[logrec->header.logtype].print(logrec);
+#endif
+}
+#endif
 
 ENGINE_ERROR_CODE lrec_redo_from_record(LogRec *logrec)
 {

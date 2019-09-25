@@ -289,6 +289,19 @@ static uint32_t do_log_buff_flush(bool flush_all)
 
 static void do_log_buff_write(LogRec *logrec, log_waiter_t *waiter, bool dual_write)
 {
+#ifdef DIRECT_WRITE
+    int logsize = logrec->header.body_length + sizeof(LogHdr);
+
+    lrec_write_to_file(logrec, logsize, dual_write, log_gl.log_file.fd);
+
+    /* update nxt_flush_lsn */
+    pthread_mutex_lock(&log_gl.flush_lsn_lock);
+    log_gl.nxt_flush_lsn.roffset += logsize;
+    if (waiter != NULL) {
+        waiter->lsn = log_gl.nxt_flush_lsn;
+    }
+    pthread_mutex_unlock(&log_gl.flush_lsn_lock);
+#else
     log_BUFFER *logbuff = &log_gl.log_buffer;
     uint32_t total_length = sizeof(LogHdr) + logrec->header.body_length;
     assert(total_length < logbuff->size);
@@ -366,6 +379,7 @@ static void do_log_buff_write(LogRec *logrec, log_waiter_t *waiter, bool dual_wr
             do_log_flusher_wakeup();
         }
     }
+#endif
 }
 
 /* Log Flush Thread */
@@ -451,7 +465,10 @@ void log_get_fsync_lsn(LogSN *lsn)
 
 void cmdlog_complete_dual_write(bool success)
 {
+#ifdef DIRECT_WRITE
+#else
     log_BUFFER *logbuff = &log_gl.log_buffer;
+#endif
 
     pthread_mutex_lock(&log_gl.log_flush_lock);
     do {
@@ -463,6 +480,13 @@ void cmdlog_complete_dual_write(bool success)
             break;
         }
         if (success) {
+#ifdef DIRECT_WRITE
+            pthread_mutex_lock(&log_gl.flush_lsn_lock);
+            /* update nxt_flush_lsn */
+            log_gl.nxt_flush_lsn.filenum += 1;
+            log_gl.nxt_flush_lsn.roffset = 0;
+            pthread_mutex_unlock(&log_gl.flush_lsn_lock);
+#else
             pthread_mutex_lock(&log_gl.log_write_lock);
             if (logbuff->fque[logbuff->fend].nflush > 0) {
                 if ((++logbuff->fend) == logbuff->fqsz) logbuff->fend = 0;
@@ -475,6 +499,7 @@ void cmdlog_complete_dual_write(bool success)
             log_gl.nxt_write_lsn.filenum += 1;
             log_gl.nxt_write_lsn.roffset = 0;
             pthread_mutex_unlock(&log_gl.log_write_lock);
+#endif
 
             assert(log_gl.log_file.prev_fd == -1);
             log_gl.log_file.prev_fd = log_gl.log_file.fd;
@@ -483,6 +508,8 @@ void cmdlog_complete_dual_write(bool success)
             log_gl.log_file.size = log_gl.log_file.next_size;
             log_gl.log_file.next_size = 0;
         } else {
+#ifdef DIRECT_WRITE
+#else
             pthread_mutex_lock(&log_gl.log_write_lock);
             /* reset dual_write flag in flush reqeust queue */
             int index = logbuff->fbgn;
@@ -493,6 +520,7 @@ void cmdlog_complete_dual_write(bool success)
                 if ((++index) == logbuff->fqsz) index = 0;
             }
             pthread_mutex_unlock(&log_gl.log_write_lock);
+#endif
 
             assert(log_gl.log_file.prev_fd == -1);
             log_gl.log_file.prev_fd = log_gl.log_file.next_fd;
